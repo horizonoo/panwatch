@@ -2316,3 +2316,244 @@ def list_strategy_weight_history(
         return {"count": len(items), "items": items}
     finally:
         db.close()
+
+
+def get_stock_signal_history(
+    *,
+    symbol: str,
+    market: str = "CN",
+    days: int = 180,
+    horizon: int = 3,
+) -> dict:
+    """返回某只股票的历史信号记录及其后验结果。"""
+    days = max(7, min(int(days), 730))
+    since = (utc_now() - timedelta(days=days)).date().isoformat()
+    sym = symbol.strip().upper()
+    mkt = (market or "CN").strip().upper()
+
+    db = SessionLocal()
+    try:
+        signals = (
+            db.query(StrategySignalRun)
+            .filter(
+                StrategySignalRun.stock_symbol == sym,
+                StrategySignalRun.stock_market == mkt,
+                StrategySignalRun.snapshot_date >= since,
+            )
+            .order_by(StrategySignalRun.snapshot_date.desc())
+            .limit(200)
+            .all()
+        )
+
+        signal_ids = [s.id for s in signals]
+        outcomes_by_signal: dict[int, list[dict]] = {}
+        if signal_ids:
+            outcome_rows = (
+                db.query(StrategyOutcome)
+                .filter(
+                    StrategyOutcome.signal_run_id.in_(signal_ids),
+                    StrategyOutcome.horizon_days == int(horizon),
+                )
+                .all()
+            )
+            for o in outcome_rows:
+                outcomes_by_signal.setdefault(o.signal_run_id, []).append({
+                    "horizon_days": o.horizon_days,
+                    "base_price": o.base_price,
+                    "outcome_price": o.outcome_price,
+                    "outcome_return_pct": o.outcome_return_pct,
+                    "hit_target": o.hit_target,
+                    "hit_stop": o.hit_stop,
+                    "outcome_status": o.outcome_status,
+                    "target_date": o.target_date,
+                })
+
+        items = []
+        for s in signals:
+            outs = outcomes_by_signal.get(s.id, [])
+            outcome = outs[0] if outs else None
+            items.append({
+                "signal_run_id": s.id,
+                "snapshot_date": s.snapshot_date,
+                "strategy_code": s.strategy_code,
+                "strategy_name": s.strategy_name or s.strategy_code,
+                "action": s.action,
+                "action_label": s.action_label or s.action,
+                "score": round(float(s.score or 0), 2),
+                "confidence": round(float(s.confidence or 0), 2) if s.confidence else None,
+                "entry_low": s.entry_low,
+                "entry_high": s.entry_high,
+                "stop_loss": s.stop_loss,
+                "target_price": s.target_price,
+                "reason": s.reason or "",
+                "outcome": outcome,
+            })
+
+        # 统计
+        evaluated = [x for x in items if x["outcome"] and x["outcome"]["outcome_status"] not in ("pending", "")]
+        wins = [x for x in evaluated if (x["outcome"]["outcome_return_pct"] or 0) > 0]
+        avg_ret = (
+            sum(x["outcome"]["outcome_return_pct"] for x in evaluated if x["outcome"]["outcome_return_pct"] is not None)
+            / len(evaluated)
+        ) if evaluated else None
+
+        return {
+            "symbol": sym,
+            "market": mkt,
+            "stock_name": signals[0].stock_name if signals else "",
+            "horizon_days": int(horizon),
+            "days": days,
+            "total_signals": len(items),
+            "evaluated_count": len(evaluated),
+            "win_count": len(wins),
+            "win_rate": round(len(wins) / len(evaluated) * 100, 1) if evaluated else None,
+            "avg_return_pct": round(avg_ret, 2) if avg_ret is not None else None,
+            "items": items,
+        }
+    finally:
+        db.close()
+
+
+def get_accuracy_trend(
+    *,
+    days: int = 180,
+    strategy_code: str = "",
+    market: str = "",
+    horizon: int = 3,
+    granularity: str = "week",  # "week" | "month"
+) -> dict:
+    """按时间粒度（周/月）返回胜率趋势。"""
+    days = max(7, min(int(days), 730))
+    since = utc_now() - timedelta(days=days)
+    db = SessionLocal()
+    try:
+        q = (
+            db.query(
+                StrategyOutcome.snapshot_date,
+                func.count(StrategyOutcome.id).label("total"),
+                func.sum(case((StrategyOutcome.outcome_return_pct > 0, 1), else_=0)).label("wins"),
+                func.avg(StrategyOutcome.outcome_return_pct).label("avg_ret"),
+            )
+            .filter(
+                StrategyOutcome.created_at >= since,
+                StrategyOutcome.outcome_status.in_(("evaluated", "hit_target", "hit_stop")),
+                StrategyOutcome.horizon_days == int(horizon),
+            )
+        )
+        code = (strategy_code or "").strip()
+        if code:
+            q = q.filter(StrategyOutcome.strategy_code == code)
+        mkt = (market or "").strip().upper()
+        if mkt:
+            q = q.filter(StrategyOutcome.stock_market == mkt)
+
+        rows = q.group_by(StrategyOutcome.snapshot_date).order_by(StrategyOutcome.snapshot_date).all()
+
+        # 按周/月聚合
+        buckets: dict[str, dict] = {}
+        for snap_date, total, wins, avg_ret in rows:
+            try:
+                d = date.fromisoformat(str(snap_date)[:10])
+            except Exception:
+                continue
+            if granularity == "month":
+                key = d.strftime("%Y-%m")
+            else:
+                y, w, _ = d.isocalendar()
+                key = f"{y}-W{w:02d}"
+            b = buckets.setdefault(key, {"total": 0, "wins": 0, "ret_sum": 0.0})
+            b["total"] += int(total or 0)
+            b["wins"] += int(wins or 0)
+            b["ret_sum"] += float(avg_ret or 0.0) * int(total or 0)
+
+        periods = []
+        for key in sorted(buckets.keys()):
+            b = buckets[key]
+            t = b["total"]
+            w = b["wins"]
+            periods.append({
+                "period": key,
+                "total": t,
+                "wins": w,
+                "win_rate": round(w / t * 100.0, 2) if t else 0.0,
+                "avg_return_pct": round(b["ret_sum"] / t, 4) if t else 0.0,
+            })
+
+        return {
+            "horizon_days": int(horizon),
+            "granularity": granularity,
+            "days": days,
+            "strategy_code": code,
+            "market": mkt,
+            "periods": periods,
+        }
+    finally:
+        db.close()
+
+
+def get_confidence_calibration(
+    *,
+    days: int = 180,
+    horizon: int = 3,
+    market: str = "",
+) -> dict:
+    """信心度校准：按 confidence 分桶，返回各桶实际胜率（检验过度/低估自信）。"""
+    days = max(7, min(int(days), 730))
+    since = utc_now() - timedelta(days=days)
+    db = SessionLocal()
+    try:
+        q = (
+            db.query(
+                StrategySignalRun.confidence,
+                StrategyOutcome.outcome_return_pct,
+            )
+            .join(StrategyOutcome, StrategyOutcome.signal_run_id == StrategySignalRun.id)
+            .filter(
+                StrategyOutcome.created_at >= since,
+                StrategyOutcome.outcome_status.in_(("evaluated", "hit_target", "hit_stop")),
+                StrategyOutcome.horizon_days == int(horizon),
+                StrategySignalRun.confidence.isnot(None),
+            )
+        )
+        mkt = (market or "").strip().upper()
+        if mkt:
+            q = q.filter(StrategyOutcome.stock_market == mkt)
+
+        rows = q.all()
+
+        BUCKETS = [(0.0, 0.5), (0.5, 0.6), (0.6, 0.7), (0.7, 0.8), (0.8, 0.9), (0.9, 1.01)]
+        bucket_labels = [f"{int(lo*100)}-{int(min(hi,1.0)*100)}%" for lo, hi in BUCKETS]
+        bucket_data: dict[str, dict] = {lbl: {"total": 0, "wins": 0, "conf_sum": 0.0} for lbl in bucket_labels}
+
+        for conf, ret_pct in rows:
+            c = float(conf or 0.0)
+            for (lo, hi), label in zip(BUCKETS, bucket_labels):
+                if lo <= c < hi:
+                    bucket_data[label]["total"] += 1
+                    if (ret_pct or 0.0) > 0:
+                        bucket_data[label]["wins"] += 1
+                    bucket_data[label]["conf_sum"] += c
+                    break
+
+        buckets_out = []
+        for label in bucket_labels:
+            b = bucket_data[label]
+            t = b["total"]
+            w = b["wins"]
+            buckets_out.append({
+                "bucket": label,
+                "total": t,
+                "wins": w,
+                "win_rate": round(w / t * 100.0, 2) if t else None,
+                "avg_confidence": round(b["conf_sum"] / t * 100.0, 1) if t else None,
+            })
+
+        return {
+            "horizon_days": int(horizon),
+            "days": days,
+            "market": mkt,
+            "total_samples": len(rows),
+            "buckets": buckets_out,
+        }
+    finally:
+        db.close()

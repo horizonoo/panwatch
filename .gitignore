@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 .venv/
+.venv-codex/
 venv/
 data/*.db
 data/*.json

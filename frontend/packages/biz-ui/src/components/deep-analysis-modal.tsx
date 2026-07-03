@@ -89,6 +89,7 @@ export interface DeepAnalysisModalProps {
   stockId: number
   stockName: string
   stockSymbol: string
+  stockMarket?: string
   /** 历史分析(若有,直接展示) */
   initialResult?: DeepAnalysisResult | null
 }
@@ -99,6 +100,7 @@ export function DeepAnalysisModal({
   stockId,
   stockName,
   stockSymbol,
+  stockMarket = 'CN',
   initialResult = null,
 }: DeepAnalysisModalProps) {
   const { toast } = useToast()
@@ -273,13 +275,21 @@ export function DeepAnalysisModal({
     setProgress(null)
     triggerStartedRef.current = Date.now()
     try {
-      const triggerResp = await tradingAgentsApi.trigger(stockId, { force })
+      const triggerResp = stockId > 0
+        ? await tradingAgentsApi.trigger(stockId, { force })
+        : await tradingAgentsApi.triggerSymbol(
+          { symbol: stockSymbol, market: stockMarket, name: stockName },
+          { force },
+        )
       const tid = triggerResp.trace_id || ''
       setTraceId(tid)
+      if (triggerResp.deduplicated || triggerResp.queued === false) {
+        toast(triggerResp.message || '已有深度分析任务正在执行', 'info')
+      }
       if (!tid) {
         // 后端未返回 trace_id,只显示 message
-        setStage('done')
-        toast(triggerResp.message || '已触发', 'success')
+        setStage('idle')
+        toast(triggerResp.message || '未提交新任务', 'info')
         return
       }
       // 持久化 trace_id 让关闭重开能恢复进度
@@ -294,7 +304,7 @@ export function DeepAnalysisModal({
       setStage('error')
       setError(e instanceof Error ? e.message : '触发失败')
     }
-  }, [stockId, stockSymbol, pollProgress, toast])
+  }, [stockId, stockMarket, stockName, stockSymbol, pollProgress, toast])
 
   const handleClose = useCallback(() => {
     if (timerRef.current) {
@@ -312,7 +322,7 @@ export function DeepAnalysisModal({
             🧠 深度分析 · {stockName} ({stockSymbol})
           </DialogTitle>
           <DialogDescription>
-            TradingAgents 多 Agent 决策框架 · 仅供学习研究参考,不构成投资建议
+            本地模型自动使用轻量深度分析 · 可查看进度与完成结果 · 仅供学习研究参考
           </DialogDescription>
         </DialogHeader>
 
@@ -320,6 +330,7 @@ export function DeepAnalysisModal({
           <IdleView
             stockSymbol={stockSymbol}
             budget={budget}
+            localMode
             onStart={() => handleStart(false)}
             onCancel={handleClose}
           />
@@ -355,11 +366,13 @@ export function DeepAnalysisModal({
 function IdleView({
   stockSymbol,
   budget,
+  localMode = false,
   onStart,
   onCancel,
 }: {
   stockSymbol: string
   budget: BudgetInfo | null
+  localMode?: boolean
   onStart: () => void
   onCancel: () => void
 }) {
@@ -370,16 +383,18 @@ function IdleView({
       <div className="rounded-lg bg-accent/30 p-3 space-y-1.5">
         <div className="font-medium">即将分析:{stockSymbol}</div>
         <div className="text-muted-foreground">
-          调用 4 类分析师(技术 / 情绪 / 新闻 / 基本面) + 看多看空辩论 + 风控 + PM 整合
+          {localMode
+            ? '本地 Ollama/Qwen 将使用单次轻量深度分析，完成后自动落库并展示结果'
+            : '调用 4 类分析师(技术 / 情绪 / 新闻 / 基本面) + 看多看空辩论 + 风控 + PM 整合'}
         </div>
         <div className="text-[11px] text-muted-foreground mt-2 space-y-0.5">
-          <div>⏱ 预计耗时:3-8 分钟</div>
+          <div>预计耗时:{localMode ? '约 1-5 分钟，取决于本地模型速度' : '3-8 分钟'}</div>
           {est ? (
-            <div>💰 预估成本:${est.cost_low_usd.toFixed(2)} - ${est.cost_high_usd.toFixed(2)} ({est.model})</div>
+            <div>预估成本:${localMode ? '0.00 本地模型' : `${est.cost_low_usd.toFixed(2)} - ${est.cost_high_usd.toFixed(2)} (${est.model})`}</div>
           ) : (
-            <div>💰 预估成本:加载中...</div>
+            <div>预估成本:加载中...</div>
           )}
-          <div>ℹ️ 异步执行,可关闭弹窗,完成时通过通知渠道推送</div>
+          <div>异步执行，可关闭弹窗；重新打开同一标的会恢复进度</div>
         </div>
       </div>
 
@@ -421,6 +436,7 @@ function RunningView({
   const elapsed = progress?.elapsed_sec ?? 0
   const cost = progress?.total_cost_usd ?? 0
   const stages = progress?.stages ?? []
+  const currentStage = progress?.current_stage ? (STAGE_LABEL[progress.current_stage] || progress.current_stage) : '准备中'
 
   return (
     <div className="space-y-4 text-[13px]">
@@ -431,6 +447,10 @@ function RunningView({
           <span className="ml-auto text-[11px] text-muted-foreground">
             已用 {formatElapsed(elapsed)} · ${cost.toFixed(4)}
           </span>
+        </div>
+        <div className="text-[12px] text-muted-foreground">
+          当前阶段：<span className="text-foreground font-medium">{currentStage}</span>
+          {progress?.run?.model_label ? <span className="ml-2 font-mono text-[11px]">{progress.run.model_label}</span> : null}
         </div>
         <div className="space-y-1 mt-3">
           {stages.length > 0 ? stages.map((s) => (

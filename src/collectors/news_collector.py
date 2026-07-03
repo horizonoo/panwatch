@@ -567,6 +567,163 @@ class EastMoneyNewsCollector(BaseNewsCollector):
         )
 
 
+def _dig(data, path: str, default=None):
+    cur = data
+    for part in (path or "").split("."):
+        if not part:
+            continue
+        if isinstance(cur, list):
+            try:
+                cur = cur[int(part)]
+            except Exception:
+                return default
+        elif isinstance(cur, dict):
+            cur = cur.get(part)
+        else:
+            return default
+    return cur if cur is not None else default
+
+
+def _parse_news_datetime(value) -> datetime:
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        if ts > 10_000_000_000:
+            ts = ts / 1000
+        return datetime.fromtimestamp(ts)
+    text = str(value or "").strip()
+    if not text:
+        return datetime.now()
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        return datetime.now()
+
+
+def _parse_importance(value) -> int:
+    if isinstance(value, str):
+        text = value.strip().lower()
+        label_map = {
+            "high": 3,
+            "important": 3,
+            "重大": 3,
+            "medium": 2,
+            "normal": 1,
+            "low": 0,
+        }
+        if text in label_map:
+            return label_map[text]
+    try:
+        importance = int(float(value or 1))
+    except (TypeError, ValueError):
+        importance = 1
+    return max(0, min(3, importance))
+
+
+def _news_dedupe_key(news: NewsItem) -> tuple[str, str]:
+    external_id = str(news.external_id or "").strip()
+    if external_id:
+        return news.source, f"id:{external_id}"
+    title_key = re.sub(r"\s+", "", (news.title or "").strip().lower())
+    day = news.publish_time.strftime("%Y-%m-%d") if news.publish_time else ""
+    return news.source, f"title:{day}:{title_key}"
+
+
+class GenericHttpNewsCollector(BaseNewsCollector):
+    """通用授权新闻接口适配器。
+
+    用于接入华尔街见闻/金十/TradingView/Investing/富途等需要授权或代理的来源。
+    DataSource.config 示例:
+    {
+      "url": "https://your-news-gateway.example.com/news",
+      "method": "GET",
+      "headers": {"Authorization": "Bearer xxx"},
+      "params": {"limit": 50},
+      "json_body": {},
+      "items_path": "data.items",
+      "field_map": {
+        "id": "id",
+        "title": "title",
+        "content": "summary",
+        "time": "published_at",
+        "url": "url",
+        "symbols": "symbols"
+      }
+    }
+    """
+
+    source = "generic_http"
+
+    def __init__(self, source: str, config: dict | None = None):
+        self.source = source
+        self.config = config or {}
+
+    async def fetch_news(self, symbols: list[str] | None = None, since: datetime | None = None) -> list[NewsItem]:
+        url = str(self.config.get("url") or "").strip()
+        if not url:
+            logger.warning("%s 新闻源未配置 url，跳过", self.source)
+            return []
+        method = str(self.config.get("method") or "GET").upper()
+        raw_headers = self.config.get("headers") or {}
+        headers = {
+            str(k): str(v)
+            for k, v in raw_headers.items()
+            if v is not None and str(v).strip()
+        }
+        params = dict(self.config.get("params") or {})
+        json_body = self.config.get("json_body")
+        if symbols:
+            params.setdefault("symbols", ",".join(symbols))
+        timeout = float(self.config.get("timeout", 12))
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            resp = await client.request(
+                method,
+                url,
+                headers=headers,
+                params=params,
+                json=json_body if isinstance(json_body, dict) and json_body else None,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+
+        items = _dig(payload, str(self.config.get("items_path") or "items"), payload)
+        if isinstance(items, dict):
+            items = list(items.values())
+        if not isinstance(items, list):
+            return []
+
+        fmap = self.config.get("field_map") or {}
+        out: list[NewsItem] = []
+        wanted = {str(s).upper() for s in (symbols or []) if s}
+        for idx, raw in enumerate(items):
+            if not isinstance(raw, dict):
+                continue
+            title = str(_dig(raw, fmap.get("title", "title"), "") or "").strip()
+            if not title:
+                continue
+            raw_symbols = _dig(raw, fmap.get("symbols", "symbols"), []) or []
+            if isinstance(raw_symbols, str):
+                raw_symbols = [x.strip() for x in re.split(r"[,，\s]+", raw_symbols) if x.strip()]
+            item_symbols = [str(s).upper() for s in raw_symbols if s]
+            if wanted and item_symbols and not (wanted & set(item_symbols)):
+                continue
+            publish_time = _parse_news_datetime(_dig(raw, fmap.get("time", "published_at"), ""))
+            if since and publish_time < since:
+                continue
+            external_id = str(_dig(raw, fmap.get("id", "id"), "") or f"{self.source}:{idx}:{title[:40]}")
+            importance = _parse_importance(_dig(raw, fmap.get("importance", "importance"), 1))
+            out.append(NewsItem(
+                source=self.source,
+                external_id=external_id,
+                title=title,
+                content=str(_dig(raw, fmap.get("content", "content"), "") or ""),
+                publish_time=publish_time,
+                symbols=item_symbols,
+                importance=importance,
+                url=str(_dig(raw, fmap.get("url", "url"), "") or ""),
+            ))
+        return out
+
+
 class NewsCollector:
     """聚合新闻采集器"""
 
@@ -577,6 +734,11 @@ class NewsCollector:
             symbol_names=config.get("symbol_names")  # 可选，不传则自动从数据库获取
         ),
         "eastmoney": lambda config: EastMoneyNewsCollector(),
+        "wallstreetcn": lambda config: GenericHttpNewsCollector("wallstreetcn", config),
+        "jin10": lambda config: GenericHttpNewsCollector("jin10", config),
+        "tradingview": lambda config: GenericHttpNewsCollector("tradingview", config),
+        "investing": lambda config: GenericHttpNewsCollector("investing", config),
+        "futu": lambda config: GenericHttpNewsCollector("futu", config),
     }
 
     def __init__(self, collectors: list[BaseNewsCollector] | None = None):
@@ -665,11 +827,11 @@ class NewsCollector:
         # 按时间倒序 + 重要性倒序排列
         all_news.sort(key=lambda x: (x.publish_time, x.importance), reverse=True)
 
-        # 去重（按 source + external_id）
+        # 去重:优先 source+external_id；缺 ID 时用同源同日标题兜底。
         seen = set()
         unique_news = []
         for news in all_news:
-            key = (news.source, news.external_id)
+            key = _news_dedupe_key(news)
             if key not in seen:
                 seen.add(key)
                 unique_news.append(news)

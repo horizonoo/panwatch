@@ -40,10 +40,10 @@ class EastMoneyDiscoveryCollector:
     def __init__(
         self,
         *,
-        timeout_s: float = 10.0,
+        timeout_s: float = 5.0,
         verify_ssl: bool = False,
         proxy: str | None = None,
-        retries: int = 1,
+        retries: int = 0,
         backoff_s: float = 0.4,
     ):
         self.timeout_s = float(timeout_s)

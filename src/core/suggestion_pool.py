@@ -10,6 +10,7 @@ from src.web.database import SessionLocal
 from src.web.models import StockSuggestion
 from src.core.timezone import utc_now, to_iso_with_tz
 from src.core.json_safe import to_jsonable
+from src.core.signals.structured_output import ACTION_LABELS, normalize_action
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,57 @@ AGENT_LABELS = {
     "daily_report": "收盘复盘",
     "news_digest": "新闻速递",
 }
+
+
+ACTION_ALERTS = {"buy", "add", "alert", "avoid", "sell", "reduce"}
+ENTRY_ACTIONS = {"buy", "add"}
+MIN_ENTRY_QUALITY_SCORE = 50.0
+
+
+def normalize_suggestion_action(action: str, action_label: str = "") -> tuple[str, str]:
+    """Normalize saved suggestion action and fill a conservative display label."""
+    normalized = normalize_action(action)
+    if not normalized:
+        normalized = "watch"
+    label = _norm_text(action_label) or ACTION_LABELS.get(normalized, normalized)
+    return normalized, label
+
+
+def is_actionable_alert(action: str) -> bool:
+    """Whether a saved suggestion is actionable enough to raise UI attention."""
+    normalized = normalize_action(action) or action
+    return normalized in ACTION_ALERTS
+
+
+def apply_quality_guardrail(
+    action: str,
+    action_label: str,
+    reason: str = "",
+    meta: dict | None = None,
+) -> tuple[str, str, str, dict]:
+    """Downgrade entry suggestions when source context is too weak."""
+    safe_meta = dict(meta or {})
+    try:
+        quality = float(safe_meta.get("context_quality_score"))
+    except (TypeError, ValueError):
+        return action, action_label, reason, safe_meta
+
+    if action not in ENTRY_ACTIONS or quality >= MIN_ENTRY_QUALITY_SCORE:
+        return action, action_label, reason, safe_meta
+
+    safe_meta["quality_guardrail"] = {
+        "from_action": action,
+        "from_action_label": action_label,
+        "context_quality_score": quality,
+        "min_entry_quality_score": MIN_ENTRY_QUALITY_SCORE,
+    }
+    guardrail_reason = (
+        f"上下文质量分 {quality:.0f} 低于 {MIN_ENTRY_QUALITY_SCORE:.0f}，"
+        "进攻性建议降级为观望。"
+    )
+    merged_reason = f"{guardrail_reason} {reason}".strip()
+    return "watch", ACTION_LABELS["watch"], merged_reason, safe_meta
+
 
 def save_suggestion(
     stock_symbol: str,
@@ -81,6 +133,10 @@ def save_suggestion(
     db = SessionLocal()
     try:
         market = (stock_market or "CN").strip().upper() or "CN"
+        action, action_label = normalize_suggestion_action(action, action_label)
+        action, action_label, reason, meta = apply_quality_guardrail(
+            action, action_label, reason, meta
+        )
 
         # 计算过期时间（使用 UTC）
         if expires_hours is None:
@@ -367,8 +423,7 @@ def _to_dict(suggestion: StockSuggestion, now: Optional[datetime] = None) -> dic
         "prompt_context": suggestion.prompt_context or "",
         "ai_response": suggestion.ai_response or "",
         "meta": suggestion.meta or {},
-        "should_alert": (suggestion.action or "")
-        in ("alert", "avoid", "sell", "reduce"),
+        "should_alert": is_actionable_alert(suggestion.action or ""),
     }
 
 

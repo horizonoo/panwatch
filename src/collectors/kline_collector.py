@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -115,14 +116,19 @@ def _fetch_stooq_us_klines(symbol: str) -> list[KlineData]:
     headers = {"User-Agent": "PanWatch/1.0 (+https://github.com/)"}
     last_err = None
     text = ""
-    for attempt in range(3):
+    # Stooq 为境外站点，国内需经代理访问；优先用显式代理，回退到 env 代理。
+    _stooq_proxy = (
+        os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy") or None
+    )
+    for attempt in range(2):
         try:
-            timeout = 12 + attempt * 6
+            timeout = 6 + attempt * 3
             with httpx.Client(
                 follow_redirects=True,
                 timeout=timeout,
                 headers=headers,
-                trust_env=False,  # 行情直连,绕过 env 代理(生产代理会拦行情接口)
+                proxy=_stooq_proxy,
+                trust_env=bool(_stooq_proxy),
             ) as client:
                 resp = client.get(url, params=params)
                 resp.raise_for_status()
@@ -166,6 +172,76 @@ def _fetch_stooq_us_klines(symbol: str) -> list[KlineData]:
         except Exception:
             continue
     _STOOQ_CACHE[sym] = (now, out)
+    return out
+
+
+def _fetch_yahoo_us_klines(symbol: str, days: int = 250) -> list[KlineData]:
+    """从 Yahoo Finance chart API 取美股日 K(免费 JSON,境外需代理)。
+
+    Stooq 已加 JS 反爬墙不可用，Yahoo 为稳定替代源。
+    Endpoint: query1.finance.yahoo.com/v8/finance/chart/AAPL?range=1y&interval=1d
+    """
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return []
+    now = time.time()
+    cached = _STOOQ_CACHE.get(f"yh:{sym}")
+    if cached and (now - cached[0]) < _STOOQ_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    rng = "2y" if days > 250 else "1y"
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
+    params = {"range": rng, "interval": "1d"}
+    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
+    proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy") or None
+
+    data = None
+    for attempt in range(2):
+        try:
+            with httpx.Client(
+                follow_redirects=True, timeout=8 + attempt * 4,
+                headers=headers, proxy=proxy, trust_env=bool(proxy),
+            ) as client:
+                resp = client.get(url, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+            break
+        except Exception as e:
+            if attempt == 1:
+                logger.warning(f"Yahoo 获取 {symbol} K线失败: {e}")
+            time.sleep(0.4 * (attempt + 1))
+
+    out: list[KlineData] = []
+    try:
+        result = (data or {}).get("chart", {}).get("result", [])
+        if not result:
+            return []
+        r0 = result[0]
+        ts = r0.get("timestamp") or []
+        q = (r0.get("indicators", {}).get("quote") or [{}])[0]
+        opens, highs = q.get("open") or [], q.get("high") or []
+        lows, closes = q.get("low") or [], q.get("close") or []
+        vols = q.get("volume") or []
+        from datetime import datetime as _dt
+        for i, t in enumerate(ts):
+            try:
+                o, h, l, c = opens[i], highs[i], lows[i], closes[i]
+                if None in (o, h, l, c):
+                    continue
+                out.append(KlineData(
+                    date=_dt.utcfromtimestamp(t).strftime("%Y-%m-%d"),
+                    open=float(o), high=float(h), low=float(l), close=float(c),
+                    volume=float(vols[i] or 0) if i < len(vols) else 0,
+                ))
+            except Exception:
+                continue
+    except Exception as e:
+        logger.warning(f"Yahoo 解析 {symbol} K线失败: {e}")
+        return []
+
+    out.sort(key=lambda b: b.date)
+    if out:
+        _STOOQ_CACHE[f"yh:{sym}"] = (now, out)
     return out
 
 
@@ -250,7 +326,7 @@ def _fetch_eastmoney_klines(
         try:
             with httpx.Client(
                 follow_redirects=True,
-                timeout=12 + attempt * 6,
+                timeout=6 + attempt * 3,
                 headers=headers,
                 trust_env=False,  # 行情直连,绕过 env 代理(生产代理会拦 push2his.eastmoney)
             ) as client:
@@ -650,11 +726,11 @@ def _fetch_tencent_klines(
     }
     klines: list[KlineData] = []
     last_err = None
-    for attempt in range(3):
+    for attempt in range(2):
         _throttle_tencent()
         try:
             with httpx.Client(
-                follow_redirects=True, timeout=10 + attempt * 4, trust_env=False
+                follow_redirects=True, timeout=6 + attempt * 3, trust_env=False
             ) as client:  # 行情直连,绕过 env 代理(生产代理会拦行情接口)
                 resp = client.get(TENCENT_KLINE_URL, params=params)
                 text = resp.text
@@ -775,9 +851,12 @@ class KlineCollector:
         """tencent → stooq(US) / eastmoney(CN/HK) 链路取数(不含缓存/合并逻辑)。"""
         klines = _fetch_tencent_klines(symbol, self.market, days)
 
-        # Tencent 对部分美股返回的 day 数据异常偏少（仅 1-2 条），使用 Stooq 回退。
+        # Tencent 对部分美股返回的 day 数据异常偏少（仅 1-2 条）。
+        # Stooq 已加 JS 反爬墙不可用，优先 Yahoo，再回退 Stooq。
         if self.market == MarketCode.US and len(klines) < max(10, min(days, 30)):
-            fallback = _fetch_stooq_us_klines(symbol)
+            fallback = _fetch_yahoo_us_klines(symbol, days=days)
+            if not fallback:
+                fallback = _fetch_stooq_us_klines(symbol)
             if fallback:
                 klines = fallback
 

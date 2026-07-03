@@ -25,6 +25,8 @@ from src.core.agent_catalog import AGENT_KIND_WORKFLOW, infer_agent_kind
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+_TRADINGAGENTS_TRIGGER_LOCK = threading.Lock()
+
 
 class StockCreate(BaseModel):
     symbol: str
@@ -454,6 +456,20 @@ async def trigger_stock_agent(
         # 异步模式：后台执行，立即返回
         sa_id = sa.id if sa else None
 
+        lock_acquired = False
+        if agent_name == "tradingagents":
+            lock_acquired = _TRADINGAGENTS_TRIGGER_LOCK.acquire(blocking=False)
+            if not lock_acquired:
+                logger.info(
+                    f"[TA] 已有其他深度分析任务在执行,拒绝新任务 - {trigger_stock.symbol}"
+                )
+                return {
+                    "queued": False,
+                    "trace_id": "",
+                    "message": "已有其他深度分析正在执行,请等待完成后再触发",
+                    "deduplicated": True,
+                }
+
         def _runner():
             try:
                 asyncio.run(trigger_agent_for_stock(
@@ -469,6 +485,9 @@ async def trigger_stock_agent(
                 logger.info(f"Agent {agent_name} 后台执行完成 - {trigger_stock.symbol}")
             except Exception:
                 logger.exception(f"Agent {agent_name} 后台执行失败 - {trigger_stock.symbol}")
+            finally:
+                if agent_name == "tradingagents" and lock_acquired:
+                    _TRADINGAGENTS_TRIGGER_LOCK.release()
 
         t = threading.Thread(
             target=_runner,
@@ -479,6 +498,16 @@ async def trigger_stock_agent(
         return {"queued": True, "trace_id": trace_id, "message": "已提交后台执行"}
 
     # 同步模式：等待结果返回
+    lock_acquired = False
+    if agent_name == "tradingagents":
+        lock_acquired = _TRADINGAGENTS_TRIGGER_LOCK.acquire(blocking=False)
+        if not lock_acquired:
+            return {
+                "queued": False,
+                "trace_id": "",
+                "message": "已有其他深度分析正在执行,请等待完成后再触发",
+                "deduplicated": True,
+            }
     try:
         result = await trigger_agent_for_stock(
             agent_name,
@@ -490,16 +519,20 @@ async def trigger_stock_agent(
             trace_id=trace_id,
             force_refresh=force_refresh,
         )
-        logger.info(f"Agent {agent_name} 执行完成 - {trigger_stock.symbol}")
-        return {
-            "result": result,
-            "trace_id": trace_id,
-            "code": int(result.get("code", 0)),
-            "success": bool(result.get("success", True)),
-            "message": result.get("message", "ok"),
-        }
     except ValueError as e:
         raise HTTPException(400, str(e))
     except Exception as e:
         logger.error(f"Agent {agent_name} 执行失败 - {trigger_stock.symbol}: {e}")
         raise HTTPException(500, f"Agent 执行失败: {e}")
+    finally:
+        if agent_name == "tradingagents" and lock_acquired:
+            _TRADINGAGENTS_TRIGGER_LOCK.release()
+
+    logger.info(f"Agent {agent_name} 执行完成 - {trigger_stock.symbol}")
+    return {
+        "result": result,
+        "trace_id": trace_id,
+        "code": int(result.get("code", 0)),
+        "success": bool(result.get("success", True)),
+        "message": result.get("message", "ok"),
+    }

@@ -62,6 +62,7 @@ class DataCollectorManager:
             XueqiuNewsCollector,
             EastMoneyStockNewsCollector,
             EastMoneyNewsCollector,
+            GenericHttpNewsCollector,
         )
         from src.collectors.kline_collector import KlineCollector
         from src.collectors.capital_flow_collector import CapitalFlowCollector
@@ -75,6 +76,11 @@ class DataCollectorManager:
                 ),
                 "eastmoney_news": lambda cfg: EastMoneyStockNewsCollector(),
                 "eastmoney": lambda cfg: EastMoneyNewsCollector(),
+                "wallstreetcn": lambda cfg: GenericHttpNewsCollector("wallstreetcn", cfg),
+                "jin10": lambda cfg: GenericHttpNewsCollector("jin10", cfg),
+                "tradingview": lambda cfg: GenericHttpNewsCollector("tradingview", cfg),
+                "investing": lambda cfg: GenericHttpNewsCollector("investing", cfg),
+                "futu": lambda cfg: GenericHttpNewsCollector("futu", cfg),
             },
             "kline": {
                 "tencent": lambda cfg: ("tencent", KlineCollector),
@@ -419,6 +425,7 @@ class DataCollectorManager:
                 XueqiuNewsCollector,
                 EastMoneyStockNewsCollector,
                 EastMoneyNewsCollector,
+                GenericHttpNewsCollector,
             )
 
             since = datetime.now() - timedelta(hours=24)
@@ -434,6 +441,8 @@ class DataCollectorManager:
                 collector = EastMoneyStockNewsCollector(symbol_names=symbol_names)
             elif source.provider == "eastmoney":
                 collector = EastMoneyNewsCollector()
+            elif source.provider in {"wallstreetcn", "jin10", "tradingview", "investing", "futu"}:
+                collector = GenericHttpNewsCollector(source.provider, source.config or {})
 
             if collector:
                 news = await collector.fetch_news(symbols=test_symbols, since=since)
@@ -450,7 +459,10 @@ class DataCollectorManager:
                     data=[
                         {
                             "title": n.title[:60],
+                            "content": (n.content or "")[:120],
                             "time": n.publish_time.strftime("%m-%d %H:%M"),
+                            "source": n.source,
+                            "url": n.url,
                         }
                         for n in news[:10]
                     ],

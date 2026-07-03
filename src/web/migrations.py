@@ -1585,6 +1585,138 @@ def _m118_paper_trading_market_allocations(conn: Connection) -> None:
         )
 
 
+def _m119_learning_loop_tables(conn: Connection) -> None:
+    _add_column_if_missing(
+        conn,
+        "real_trade_sells",
+        "sell_currency",
+        "ALTER TABLE real_trade_sells ADD COLUMN sell_currency TEXT DEFAULT ''",
+    )
+    conn.execute(
+        text(
+            """
+CREATE TABLE IF NOT EXISTS trade_reviews (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source TEXT NOT NULL DEFAULT 'manual',
+  source_id INTEGER,
+  stock_symbol TEXT NOT NULL,
+  stock_market TEXT NOT NULL DEFAULT 'US',
+  stock_name TEXT DEFAULT '',
+  strategy_code TEXT DEFAULT '',
+  strategy_name TEXT DEFAULT '',
+  action_taken TEXT DEFAULT '',
+  thesis TEXT DEFAULT '',
+  result TEXT DEFAULT 'unknown',
+  pnl_pct REAL,
+  mistake_tags TEXT DEFAULT '[]',
+  improvement TEXT DEFAULT '',
+  confidence_before REAL,
+  confidence_after REAL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+"""
+        )
+    )
+    conn.execute(
+        text(
+            """
+CREATE TABLE IF NOT EXISTS strategy_rule_insights (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope_type TEXT NOT NULL DEFAULT 'strategy',
+  scope_key TEXT NOT NULL DEFAULT '',
+  stock_market TEXT DEFAULT '',
+  strategy_code TEXT DEFAULT '',
+  severity TEXT NOT NULL DEFAULT 'info',
+  title TEXT NOT NULL DEFAULT '',
+  recommendation TEXT NOT NULL DEFAULT '',
+  evidence TEXT DEFAULT '{}',
+  status TEXT NOT NULL DEFAULT 'active',
+  generated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+"""
+        )
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_trade_reviews_symbol",
+        "CREATE INDEX ix_trade_reviews_symbol ON trade_reviews(stock_symbol, stock_market)",
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_trade_reviews_strategy",
+        "CREATE INDEX ix_trade_reviews_strategy ON trade_reviews(strategy_code, created_at)",
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_rule_insights_scope",
+        "CREATE INDEX ix_rule_insights_scope ON strategy_rule_insights(scope_type, scope_key, status)",
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_rule_insights_strategy",
+        "CREATE INDEX ix_rule_insights_strategy ON strategy_rule_insights(strategy_code, stock_market)",
+    )
+
+
+def _m120_trade_ideas_table(conn: Connection) -> None:
+    conn.execute(
+        text(
+            """
+CREATE TABLE IF NOT EXISTS trade_ideas (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL DEFAULT '',
+  source TEXT DEFAULT 'manual',
+  raw_text TEXT DEFAULT '',
+  thesis TEXT DEFAULT '',
+  strategy_type TEXT DEFAULT 'pair_options',
+  status TEXT DEFAULT 'watching',
+  conviction TEXT DEFAULT 'medium',
+  event_date TEXT DEFAULT '',
+  entry_start TEXT DEFAULT '',
+  entry_end TEXT DEFAULT '',
+  legs TEXT DEFAULT '[]',
+  plan TEXT DEFAULT '{}',
+  catalysts TEXT DEFAULT '[]',
+  risk_checks TEXT DEFAULT '[]',
+  data_sources TEXT DEFAULT '[]',
+  metrics TEXT DEFAULT '{}',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+"""
+        )
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_trade_ideas_status",
+        "CREATE INDEX ix_trade_ideas_status ON trade_ideas(status, created_at)",
+    )
+    _create_index_if_missing(
+        conn,
+        "ix_trade_ideas_strategy",
+        "CREATE INDEX ix_trade_ideas_strategy ON trade_ideas(strategy_type, created_at)",
+    )
+
+
+def _m121_trade_idea_score_models(conn: Connection) -> None:
+    conn.execute(
+        text(
+            """
+CREATE TABLE IF NOT EXISTS trade_idea_score_models (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  model_key TEXT NOT NULL UNIQUE,
+  label TEXT NOT NULL DEFAULT '',
+  weights TEXT DEFAULT '{}',
+  enabled INTEGER DEFAULT 1,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+"""
+        )
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(101, "agent_config_kind_and_visibility", _m101_agent_config_kind),
     Migration(102, "backfill_agent_kind_data", _m102_backfill_agent_kind),
@@ -1604,6 +1736,9 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(116, "chat_tables", _m116_chat_tables),
     Migration(117, "chat_initial_context", _m117_chat_initial_context),
     Migration(118, "paper_trading_market_allocations", _m118_paper_trading_market_allocations),
+    Migration(119, "learning_loop_tables", _m119_learning_loop_tables),
+    Migration(120, "trade_ideas_table", _m120_trade_ideas_table),
+    Migration(121, "trade_idea_score_models", _m121_trade_idea_score_models),
 )
 
 

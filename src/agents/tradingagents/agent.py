@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import date, datetime, timezone
 from typing import Any
 
@@ -42,6 +43,37 @@ from src.core.analysis_history import get_analysis, save_analysis
 logger = logging.getLogger(__name__)
 
 
+def _section(markdown: str, heading: str) -> str:
+    if not markdown:
+        return ""
+    pattern = re.compile(
+        rf"^##\s+{re.escape(heading)}\s*\n(?P<body>.*?)(?=^##\s+|\Z)",
+        re.M | re.S,
+    )
+    m = pattern.search(markdown)
+    return (m.group("body").strip() if m else "")
+
+
+def _decision_from_text(text: str) -> str:
+    if not text:
+        return "HOLD"
+    low = text.lower()
+    for label in ("underweight", "overweight", "sell", "buy", "hold"):
+        if label in low:
+            return label.upper()
+    zh_map = {
+        "卖出": "SELL",
+        "减持": "UNDERWEIGHT",
+        "买入": "BUY",
+        "增持": "OVERWEIGHT",
+        "持有": "HOLD",
+    }
+    for zh, label in zh_map.items():
+        if zh in text:
+            return label
+    return "HOLD"
+
+
 class TradingAgentsUnavailable(RuntimeError):
     """tradingagents 库未安装或上游 API 变更导致不可用。"""
 
@@ -62,6 +94,7 @@ class TradingAgentsAgent(BaseAgent):
         deep_model: str | None = None,    # 推理/辩论/PM 用的强模型 (留空走默认)
         quick_model: str | None = None,   # 分析师工具调用用的快模型 (留空 = deep_model)
         timeout_minutes: int = 15,        # 整个流程硬超时;default 15 min 防卡死
+        local_mode: str = "auto",         # auto / fast / full: 本地 OpenAI 兼容模型默认走轻量路径
         emit_paper_trading_signal: bool = False,  # 是否把 BUY 决策写入 StrategySignalRun 驱动模拟盘
     ):
         # 校验分析师配置
@@ -82,6 +115,7 @@ class TradingAgentsAgent(BaseAgent):
         self.deep_model = (deep_model or "").strip() or None
         self.quick_model = (quick_model or "").strip() or None
         self.timeout_minutes = max(1, int(timeout_minutes))
+        self.local_mode = (local_mode or "auto").strip().lower()
         self.emit_paper_trading_signal = bool(emit_paper_trading_signal)
 
         # 软依赖检测
@@ -230,20 +264,10 @@ class TradingAgentsAgent(BaseAgent):
                     f"(${budget['used']:.2f} / ${self.monthly_budget_usd:.2f})"
                 )
 
-        # 2) 构造 TradingAgents config (支持 deep / quick 双模型)
-        ta_config = build_ta_llm_config(
-            context.ai_client,
-            debate_rounds=self.debate_rounds,
-            selected_analysts=self.analyst_types,
-            output_language=self.output_language,
-            deep_model=self.deep_model,
-            quick_model=self.quick_model,
-        )
-
         # 3) 进度回调
         progress_handler = PanWatchProgressHandler(trace_id, self.name)
 
-        # 4) 渲染上下文(标的元信息 + 用户持仓)注入到 TA 的 past_context 通道
+        # 2) 渲染上下文(标的元信息 + 用户持仓)注入到 TA 的 past_context 通道
         current_price = (data.get("quote") or {}).get("current_price")
         cur_price_num = current_price if isinstance(current_price, (int, float)) else None
         quote_data = data.get("quote") or {}
@@ -263,6 +287,34 @@ class TradingAgentsAgent(BaseAgent):
         # 标的元信息永远放最前(即使没有持仓也注入)
         portfolio_context_text = (
             f"{meta_context}\n\n{portfolio_part}" if portfolio_part else meta_context
+        )
+
+        if self._should_use_fast_local_mode(context.ai_client):
+            logger.info(
+                "[TA] 检测到本地/轻量模式,使用单次 LLM 深度分析 "
+                f"(model={context.ai_client.model}, mode={self.local_mode})"
+            )
+            result = await self._analyze_fast_local(
+                context=context,
+                data=data,
+                portfolio_context_text=portfolio_context_text,
+                progress_handler=progress_handler,
+            )
+            return self._finalize_result(
+                result=result,
+                stock=stock,
+                data=data,
+                progress_handler=progress_handler,
+            )
+
+        # 3) 构造 TradingAgents config (支持 deep / quick 双模型)
+        ta_config = build_ta_llm_config(
+            context.ai_client,
+            debate_rounds=self.debate_rounds,
+            selected_analysts=self.analyst_types,
+            output_language=self.output_language,
+            deep_model=self.deep_model,
+            quick_model=self.quick_model,
         )
 
         # 5) 同步阻塞,丢到线程池;加硬超时防卡死
@@ -302,6 +354,23 @@ class TradingAgentsAgent(BaseAgent):
             ta_result=ta_result,
             model_label=context.model_label,
         )
+
+        return self._finalize_result(
+            result=result,
+            stock=stock,
+            data=data,
+            progress_handler=progress_handler,
+        )
+
+    def _finalize_result(
+        self,
+        *,
+        result: AnalysisResult,
+        stock: Any,
+        data: dict,
+        progress_handler: PanWatchProgressHandler | None,
+    ) -> AnalysisResult:
+        """Persist and fan out a TradingAgents-style result."""
 
         # 存分析时实时价 → 历史决策表"分析价"立即显示(不必等当日 K线收盘回填)
         _quote = data.get("quote") or {}
@@ -412,6 +481,136 @@ class TradingAgentsAgent(BaseAgent):
 
     def _make_trace_id(self, symbol: str) -> str:
         return f"ta-{symbol}-{int(datetime.now().timestamp())}"
+
+    def _should_use_fast_local_mode(self, ai_client) -> bool:
+        """Use a bounded single-call workflow for local OpenAI-compatible models."""
+        if self.local_mode in ("full", "off", "false", "0"):
+            return False
+        if self.local_mode in ("fast", "local", "lite", "light"):
+            return True
+
+        base_url = (getattr(ai_client, "base_url", "") or "").lower()
+        model = (getattr(ai_client, "model", "") or "").lower()
+        local_markers = (
+            "127.0.0.1",
+            "localhost",
+            "0.0.0.0",
+            "host.docker.internal",
+            ":11434",
+            "ollama",
+        )
+        model_markers = ("qwen", "deepseek-r1", "llama", "mistral", "yi:")
+        return any(m in base_url for m in local_markers) or any(m in model for m in model_markers)
+
+    async def _analyze_fast_local(
+        self,
+        *,
+        context: AgentContext,
+        data: dict,
+        portfolio_context_text: str,
+        progress_handler: PanWatchProgressHandler | None = None,
+    ) -> AnalysisResult:
+        """Local-model-friendly depth analysis.
+
+        Full TradingAgents is multi-agent and can need dozens of LLM calls. Local
+        32B/70B models are good enough for synthesis, but too slow for that whole
+        graph. This path keeps the same PanWatch result shape with one bounded call.
+        """
+        stock = data["stock"]
+        system_prompt = (
+            "你是 PanWatch 的资深证券分析助手。基于给定行情、K线、事件、技术指标和用户持仓，"
+            "输出一份可执行的深度分析。不要编造未给出的财报或新闻。"
+            "必须使用中文，并在开头给出明确评级标签。"
+        )
+        user_content = self._build_fast_local_prompt(
+            stock=stock,
+            data=data,
+            portfolio_context_text=portfolio_context_text,
+        )
+        if progress_handler is not None:
+            progress_handler._emit("market_analyst", "stage_start", langgraph_node="Fast Local Analysis")
+            progress_handler._emit("llm_call", "llm_start", call_n=1)
+        content = await asyncio.wait_for(
+            context.ai_client.chat(system_prompt, user_content, temperature=0.3),
+            timeout=max(60, min(self.timeout_minutes * 60, 10 * 60)),
+        )
+        if progress_handler is not None:
+            progress_handler._emit("llm_call", "llm_end", prompt_tokens=0, completion_tokens=0, call_cost=0.0)
+            progress_handler._completed_stages.add("market_analyst")
+            progress_handler._emit("final_decision", "stage_end", langgraph_node="Fast Local Analysis")
+        state = self._state_from_fast_local_content(content)
+        ta_result = {
+            "decision": _decision_from_text(content),
+            "final_state": state,
+            "cost_usd": 0.0,
+        }
+        result = map_state_to_result(
+            stock=stock,
+            ta_result=ta_result,
+            model_label=context.model_label,
+        )
+        result.raw_data["local_fast_mode"] = True
+        result.raw_data["source_agent"] = "tradingagents_fast_local"
+        result.raw_data["fast_mode_model"] = getattr(context.ai_client, "model", "")
+        return result
+
+    def _build_fast_local_prompt(
+        self,
+        *,
+        stock: Any,
+        data: dict,
+        portfolio_context_text: str,
+    ) -> str:
+        quote = data.get("quote") or {}
+        klines = data.get("klines") or []
+        events = data.get("events") or []
+        capital = data.get("capital_flow") or []
+        technical = data.get("technical") or {}
+        financial = data.get("financial") or {}
+
+        def _clip(value: Any, limit: int) -> str:
+            text = value if isinstance(value, str) else repr(value)
+            return text[:limit] + ("..." if len(text) > limit else "")
+
+        recent_klines = klines[-45:] if isinstance(klines, list) else klines
+        recent_events = events[:12] if isinstance(events, list) else events
+        recent_capital = capital[:20] if isinstance(capital, list) else capital
+
+        return (
+            f"# 标的\n"
+            f"- 代码: {stock.symbol}\n"
+            f"- 名称: {stock.name}\n"
+            f"- 市场: {stock.market.value}\n\n"
+            f"# 用户持仓/约束\n{portfolio_context_text or '无持仓信息'}\n\n"
+            f"# 最新行情\n{_clip(quote, 1800)}\n\n"
+            f"# 最近K线(最多45条)\n{_clip(recent_klines, 7000)}\n\n"
+            f"# 技术指标\n{_clip(technical, 3000)}\n\n"
+            f"# 资金流\n{_clip(recent_capital, 2500)}\n\n"
+            f"# 事件/新闻\n{_clip(recent_events, 4500)}\n\n"
+            f"# 财务摘要\n{_clip(financial, 3500)}\n\n"
+            "请按以下格式输出:\n"
+            "## 最终交易决策：Buy/Overweight/Hold/Underweight/Sell 之一\n"
+            "## 置信度：0-10\n"
+            "## 核心结论\n"
+            "## 技术面\n"
+            "## 新闻/事件面\n"
+            "## 基本面/资金面\n"
+            "## 持仓建议\n"
+            "## 风险与失效条件\n"
+            "## 未来3-10个交易日观察点\n"
+        )
+
+    @staticmethod
+    def _state_from_fast_local_content(content: str) -> dict[str, str]:
+        return {
+            "market_report": _section(content, "技术面") or content,
+            "sentiment_report": _section(content, "新闻/事件面"),
+            "news_report": _section(content, "新闻/事件面"),
+            "fundamentals_report": _section(content, "基本面/资金面"),
+            "trader_investment_plan": _section(content, "持仓建议") or _section(content, "核心结论"),
+            "risk_judge_decision": _section(content, "风险与失效条件"),
+            "final_trade_decision": content,
+        }
 
     def _try_cache_hit(self, stock) -> AnalysisResult | None:
         """同标的同日是否已分析过 → 返回缓存的 AnalysisResult。"""

@@ -1,19 +1,27 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { AlertTriangle, RefreshCw, Share2, Sparkles } from 'lucide-react'
+import { useNavigate } from 'react-router-dom'
+import { AlertTriangle, Brain, CircleDollarSign, ClipboardList, Loader2, RefreshCw, Share2, Sparkles } from 'lucide-react'
 import {
   recommendationsApi,
   stocksApi,
+  tradingAgentsApi,
   type EntryCandidateItem,
   type StrategyCatalogItem,
   type StrategySignalItem,
   type StrategyStatsResponse,
+  type StockItem,
 } from '@panwatch/api'
 import { Button } from '@panwatch/base-ui/components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@panwatch/base-ui/components/ui/select'
 import { useLocalStorage } from '@/lib/utils'
 import StockInsightModal from '@panwatch/biz-ui/components/stock-insight-modal'
 import FactorWeightsPanel from '@/components/FactorWeightsPanel'
+import BacktestPanel from '@/components/BacktestPanel'
+import BacktestOptimizerPanel from '@/components/BacktestOptimizerPanel'
 import SignalScoreShareCard from '@/components/SignalScoreShareCard'
+import InvestmentIntelPanel from '@/components/InvestmentIntelPanel'
+import TradePlanPanel from '@/components/TradePlanPanel'
+import { DeepAnalysisModal } from '@panwatch/biz-ui/components/deep-analysis-modal'
 
 type SourceFilter = 'all' | 'market_scan' | 'watchlist' | 'mixed'
 type HoldingFilter = 'all' | 'held' | 'unheld'
@@ -215,6 +223,84 @@ const formatEntryDisplay = (action: string | undefined, entryLow: number | null,
   return '当前不建议开仓'
 }
 
+const midPrice = (low: number | null, high: number | null) => {
+  if (low != null && high != null) return (low + high) / 2
+  return low ?? high ?? null
+}
+
+const riskRewardText = (
+  entryLow: number | null,
+  entryHigh: number | null,
+  stopLoss: number | null,
+  targetPrice: number | null,
+) => {
+  const entry = midPrice(entryLow, entryHigh)
+  if (entry == null || stopLoss == null || targetPrice == null) return '--'
+  const risk = entry - stopLoss
+  const reward = targetPrice - entry
+  if (risk <= 0 || reward <= 0) return '--'
+  return `1:${(reward / risk).toFixed(1)}`
+}
+
+const appendTradeParam = (params: URLSearchParams, key: string, value: unknown) => {
+  if (value == null) return
+  if (typeof value === 'number') {
+    if (Number.isFinite(value)) params.set(key, String(value))
+    return
+  }
+  const text = String(value).trim()
+  if (text) params.set(key, text)
+}
+
+const buildRealTradeParams = (
+  item: StrategySignalItem,
+  entryLow: number | null,
+  entryHigh: number | null,
+  stopLoss: number | null,
+  targetPrice: number | null,
+) => {
+  const params = new URLSearchParams()
+  const entryMid = midPrice(entryLow, entryHigh)
+  params.set('prefill', 'opportunity-buy')
+  appendTradeParam(params, 'signal_id', item.id)
+  appendTradeParam(params, 'symbol', item.stock_symbol)
+  appendTradeParam(params, 'market', item.stock_market || 'CN')
+  appendTradeParam(params, 'name', item.stock_name || item.stock_symbol)
+  appendTradeParam(params, 'snapshot_date', item.snapshot_date)
+  appendTradeParam(params, 'strategy_code', item.strategy_code)
+  appendTradeParam(params, 'strategy_name', item.strategy_name)
+  appendTradeParam(params, 'action', item.action)
+  appendTradeParam(params, 'action_label', displayActionLabel(item))
+  appendTradeParam(params, 'entry_low', entryLow)
+  appendTradeParam(params, 'entry_high', entryHigh)
+  appendTradeParam(params, 'stop_loss', stopLoss)
+  appendTradeParam(params, 'target_price', targetPrice)
+  appendTradeParam(params, 'buy_price', entryMid)
+  appendTradeParam(params, 'reason', item.signal || item.reason)
+  appendTradeParam(params, 'invalidation', item.invalidation)
+  return params
+}
+
+const executionText = (
+  item: StrategySignalItem,
+  entryLow: number | null,
+  entryHigh: number | null,
+  stopLoss: number | null,
+  targetPrice: number | null,
+) => {
+  const action = (item.action || '').toLowerCase()
+  const entry = formatEntryDisplay(item.action, entryLow, entryHigh)
+  const stop = formatPlanPrice(stopLoss)
+  const target = formatPlanPrice(targetPrice)
+  if (action === 'buy' || action === 'add') {
+    return `执行: ${displayActionLabel(item)} ${entry}; 目标 ${target}; 止损 ${stop}`
+  }
+  if (action === 'hold' && item.is_holding_snapshot) {
+    return `持仓: 目标 ${target}; 跌破 ${stop} 减仓/退出`
+  }
+  return `等待: 未进入买点；目标 ${target}; 风控 ${stop}`
+}
+
 const regimeToneClass = (regime?: string) => {
   if (regime === 'bullish') return 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
   if (regime === 'bearish') return 'bg-rose-500/15 text-rose-400 border border-rose-500/30'
@@ -222,6 +308,7 @@ const regimeToneClass = (regime?: string) => {
 }
 
 export default function OpportunitiesPage() {
+  const navigate = useNavigate()
   const [loading, setLoading] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState('')
@@ -229,6 +316,8 @@ export default function OpportunitiesPage() {
   const [stats, setStats] = useState<StrategyStatsResponse | null>(null)
   const [strategyCatalog, setStrategyCatalog] = useState<StrategyCatalogItem[]>([])
   const [watchlist, setWatchlist] = useState<Set<string>>(new Set())
+  const [stockByKey, setStockByKey] = useState<Map<string, StockItem>>(new Map())
+  const [deepStatusByKey, setDeepStatusByKey] = useState<Record<string, 'running' | 'success' | 'failed' | 'stale' | 'none'>>({})
 
   const [market, setMarket] = useLocalStorage<'ALL' | 'CN' | 'HK' | 'US'>('panwatch_opportunities_market_v3', DEFAULT_FILTERS.market)
   const [source, setSource] = useLocalStorage<SourceFilter>('panwatch_opportunities_source_v3', DEFAULT_FILTERS.source)
@@ -246,6 +335,13 @@ export default function OpportunitiesPage() {
 
   // 个股 AI 评分分享卡:当前分享的信号
   const [shareSignal, setShareSignal] = useState<StrategySignalItem | null>(null)
+  const [deepAnalysisTarget, setDeepAnalysisTarget] = useState<{
+    stockId: number
+    symbol: string
+    market: string
+    name: string
+  } | null>(null)
+  const [expandedPlanKey, setExpandedPlanKey] = useState('')
 
   const openInsight = useCallback((item: StrategySignalItem) => {
     setInsightSymbol(item.stock_symbol)
@@ -259,9 +355,12 @@ export default function OpportunitiesPage() {
     try {
       const rows = await stocksApi.list()
       const set = new Set<string>((rows || []).map((s) => `${s.market}:${s.symbol}`))
+      const map = new Map<string, StockItem>((rows || []).map((s) => [`${s.market}:${s.symbol}`, s]))
       setWatchlist(set)
+      setStockByKey(map)
     } catch {
       setWatchlist(new Set())
+      setStockByKey(new Map())
     }
   }, [])
 
@@ -472,6 +571,53 @@ export default function OpportunitiesPage() {
     })
     return out
   }, [items])
+
+  const refreshDeepStatuses = useCallback(async (groups: GroupedSignal[]) => {
+    const targets = groups.slice(0, 80)
+    if (targets.length === 0) {
+      setDeepStatusByKey({})
+      return
+    }
+    const pairs = await Promise.all(targets.map(async (g) => {
+      try {
+        const info = await tradingAgentsApi.findRunning(g.primary.stock_symbol)
+        return [g.key, info.status] as const
+      } catch {
+        return [g.key, 'none'] as const
+      }
+    }))
+    setDeepStatusByKey(Object.fromEntries(pairs))
+  }, [])
+
+  useEffect(() => {
+    void refreshDeepStatuses(groupedItems)
+    const timer = window.setInterval(() => {
+      void refreshDeepStatuses(groupedItems)
+    }, 10000)
+    return () => window.clearInterval(timer)
+  }, [groupedItems, refreshDeepStatuses])
+
+  const openDeepAnalysis = useCallback((item: StrategySignalItem) => {
+    const key = `${item.stock_market || 'CN'}:${item.stock_symbol}`
+    const stock = stockByKey.get(key)
+    setDeepAnalysisTarget({
+      stockId: stock?.id ?? 0,
+      symbol: item.stock_symbol,
+      market: item.stock_market || 'CN',
+      name: item.stock_name || item.stock_symbol,
+    })
+  }, [stockByKey])
+
+  const openRealTradeBuy = useCallback((
+    item: StrategySignalItem,
+    entryLow: number | null,
+    entryHigh: number | null,
+    stopLoss: number | null,
+    targetPrice: number | null,
+  ) => {
+    const params = buildRealTradeParams(item, entryLow, entryHigh, stopLoss, targetPrice)
+    navigate(`/real-trading?${params.toString()}`)
+  }, [navigate])
 
   const filteredSummary = useMemo(() => {
     const total = groupedItems.length
@@ -707,8 +853,11 @@ export default function OpportunitiesPage() {
           const entryHigh = toNumberOrNull(item.entry_high) ?? toNumberOrNull(sourcePlan.entry_high)
           const stopLoss = toNumberOrNull(item.stop_loss) ?? toNumberOrNull(sourcePlan.stop_loss)
           const targetPrice = toNumberOrNull(item.target_price) ?? toNumberOrNull(sourcePlan.target_price)
+          const riskReward = riskRewardText(entryLow, entryHigh, stopLoss, targetPrice)
+          const execution = executionText(item, entryLow, entryHigh, stopLoss, targetPrice)
           const stateKey = `${item.snapshot_date}:${group.key}`
           const inWatchlist = watchlist.has(group.key)
+          const deepStatus = deepStatusByKey[group.key] || 'none'
           const breakdown = item.score_breakdown || {}
           const marketRegime = item.market_regime || {}
           const crossFeature = item.cross_feature || {}
@@ -753,11 +902,15 @@ export default function OpportunitiesPage() {
                     )}
                   </div>
                 </div>
-                <div className="mt-2 text-[12px] text-foreground line-clamp-2">{item.signal || item.reason || '--'}</div>
+                <div className="mt-2 rounded-md border border-primary/20 bg-primary/5 px-3 py-2 text-[12px] font-medium text-foreground">
+                  {execution}
+                </div>
+                <div className="mt-2 text-[12px] text-muted-foreground line-clamp-2">{item.signal || item.reason || '--'}</div>
                 <div className="mt-2 grid grid-cols-2 gap-2 text-[11px] text-muted-foreground">
                   <div>入场: {formatEntryDisplay(item.action, entryLow, entryHigh)}</div>
                   <div>止损: {formatPlanPrice(stopLoss)}</div>
                   <div>目标: {formatPlanPrice(targetPrice)}</div>
+                  <div>盈亏比: {riskReward}</div>
                   <div>失效: {item.invalidation || '--'}</div>
                   <div>
                     策略: {strategyHead}
@@ -809,6 +962,33 @@ export default function OpportunitiesPage() {
                 <div className="flex items-center gap-3">
                   <button
                     type="button"
+                    onClick={() => openDeepAnalysis(item)}
+                    className={`inline-flex items-center gap-1 text-[10px] transition-colors ${
+                      deepStatus === 'running'
+                        ? 'text-primary'
+                        : deepStatus === 'success'
+                          ? 'text-emerald-500'
+                          : deepStatus === 'failed'
+                            ? 'text-rose-500'
+                            : 'text-muted-foreground hover:text-primary'
+                    }`}
+                    title="查看或启动深度分析"
+                  >
+                    {deepStatus === 'running' ? (
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                    ) : (
+                      <Brain className="h-3 w-3" />
+                    )}
+                    {deepStatus === 'running'
+                      ? '深度分析中'
+                      : deepStatus === 'success'
+                        ? '查看深度结果'
+                        : deepStatus === 'failed'
+                          ? '深度分析失败'
+                          : '深度分析'}
+                  </button>
+                  <button
+                    type="button"
                     onClick={() => setShareSignal(item)}
                     className="inline-flex items-center gap-1 text-[10px] text-muted-foreground transition-colors hover:text-primary"
                     title="生成 AI 评分分享图"
@@ -816,9 +996,32 @@ export default function OpportunitiesPage() {
                     <Share2 className="h-3 w-3" />
                     分享图
                   </button>
+                  <button
+                    type="button"
+                    onClick={() => setExpandedPlanKey(expandedPlanKey === stateKey ? '' : stateKey)}
+                    className={`inline-flex items-center gap-1 text-[10px] transition-colors ${
+                      expandedPlanKey === stateKey ? 'text-primary' : 'text-muted-foreground hover:text-primary'
+                    }`}
+                    title="查看交易计划、历史胜率和多空博弈"
+                  >
+                    <ClipboardList className="h-3 w-3" />
+                    交易计划
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => openRealTradeBuy(item, entryLow, entryHigh, stopLoss, targetPrice)}
+                    className="inline-flex items-center gap-1 text-[10px] text-muted-foreground transition-colors hover:text-primary"
+                    title="用当前策略信号预填真实买入记录"
+                  >
+                    <CircleDollarSign className="h-3 w-3" />
+                    真实买入
+                  </button>
                   <div className="text-[10px] text-muted-foreground">评估: 自动后验</div>
                 </div>
               </div>
+              {expandedPlanKey === stateKey && (
+                <TradePlanPanel symbol={item.stock_symbol} market={item.stock_market || 'CN'} />
+              )}
             </div>
           )
         })}
@@ -828,7 +1031,37 @@ export default function OpportunitiesPage() {
         <div className="card p-8 text-center text-[12px] text-muted-foreground mt-4">暂无满足条件的机会</div>
       )}
 
-      <details className="mt-6 group">
+      <details className="mt-6 group" open>
+        <summary className="cursor-pointer list-none flex items-center gap-2 text-[12px] font-medium text-muted-foreground hover:text-foreground transition-colors">
+          <span className="text-[11px] opacity-60 transition-transform group-open:rotate-90">▶</span>
+          投资情报 · 多源置信度评分
+        </summary>
+        <div className="mt-3">
+          <InvestmentIntelPanel />
+        </div>
+      </details>
+
+      <details className="mt-4 group" open>
+        <summary className="cursor-pointer list-none flex items-center gap-2 text-[12px] font-medium text-muted-foreground hover:text-foreground transition-colors">
+          <span className="text-[11px] opacity-60 transition-transform group-open:rotate-90">▶</span>
+          量化策略优化 · 各市场最佳策略
+        </summary>
+        <div className="mt-3">
+          <BacktestOptimizerPanel />
+        </div>
+      </details>
+
+      <details className="mt-4 group">
+        <summary className="cursor-pointer list-none flex items-center gap-2 text-[12px] font-medium text-muted-foreground hover:text-foreground transition-colors">
+          <span className="text-[11px] opacity-60 transition-transform group-open:rotate-90">▶</span>
+          历史回测与模型准确性
+        </summary>
+        <div className="mt-3">
+          <BacktestPanel stats={stats} />
+        </div>
+      </details>
+
+      <details className="mt-4 group">
         <summary className="cursor-pointer list-none flex items-center gap-2 text-[12px] font-medium text-muted-foreground hover:text-foreground transition-colors">
           <span className="text-[11px] opacity-60 transition-transform group-open:rotate-90">▶</span>
           因子权重与战绩
@@ -846,6 +1079,22 @@ export default function OpportunitiesPage() {
         stockName={insightName}
         hasPosition={insightHasPosition}
       />
+
+      {deepAnalysisTarget && (
+        <DeepAnalysisModal
+          open={!!deepAnalysisTarget}
+          onOpenChange={(open) => {
+            if (!open) {
+              setDeepAnalysisTarget(null)
+              void refreshDeepStatuses(groupedItems)
+            }
+          }}
+          stockId={deepAnalysisTarget.stockId}
+          stockSymbol={deepAnalysisTarget.symbol}
+          stockMarket={deepAnalysisTarget.market}
+          stockName={deepAnalysisTarget.name}
+        />
+      )}
 
       {shareSignal && (
         <SignalScoreShareCard

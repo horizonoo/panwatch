@@ -26,10 +26,14 @@ from src.web.api import (
     dashboard,
     paper_trading,
     chat,
+    learning,
+    trade_ideas,
 )
 from src.web.api import factors
+from src.web.api import real_trades
 from src.web.api import health
 from src.web.api import insights
+from src.web.api import backtest_optimizer
 from src.web.api.auth import get_current_user
 from src.web.api.settings import get_app_version
 from src.web.response import ResponseWrapperMiddleware
@@ -154,6 +158,12 @@ app.include_router(
     dependencies=protected,
 )
 app.include_router(
+    backtest_optimizer.router,
+    prefix="/api/backtest-optimizer",
+    tags=["backtest-optimizer"],
+    dependencies=protected,
+)
+app.include_router(
     health.router,
     prefix="/api/health",
     tags=["health"],
@@ -169,6 +179,24 @@ app.include_router(
     chat.router,
     prefix="/api/chat",
     tags=["chat"],
+    dependencies=protected,
+)
+app.include_router(
+    real_trades.router,
+    prefix="/api/real-trades",
+    tags=["real-trades"],
+    dependencies=protected,
+)
+app.include_router(
+    learning.router,
+    prefix="/api/learning",
+    tags=["learning"],
+    dependencies=protected,
+)
+app.include_router(
+    trade_ideas.router,
+    prefix="/api/trade-ideas",
+    tags=["trade-ideas"],
     dependencies=protected,
 )
 

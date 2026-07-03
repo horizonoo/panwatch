@@ -544,6 +544,41 @@ def _build_plan(
     }
 
 
+def _sanitize_plan(action: str, plan: dict | None) -> dict:
+    """Clean impossible entry/stop/target relationships before scoring."""
+    p = dict(plan or {})
+    warnings = list(p.get("warnings") or []) if isinstance(p.get("warnings"), list) else []
+
+    entry_low = _safe_float(p.get("entry_low"))
+    entry_high = _safe_float(p.get("entry_high"))
+    stop_loss = _safe_float(p.get("stop_loss"))
+    target_price = _safe_float(p.get("target_price"))
+
+    if entry_low is not None and entry_high is not None and entry_low > entry_high:
+        entry_low, entry_high = entry_high, entry_low
+        warnings.append("入场区间上下限已自动交换")
+
+    if action in ("buy", "add"):
+        entry_floor = entry_low if entry_low is not None else entry_high
+        entry_ceiling = entry_high if entry_high is not None else entry_low
+        if stop_loss is not None and entry_floor is not None and stop_loss >= entry_floor:
+            stop_loss = None
+            warnings.append("止损价不低于入场区间，已忽略")
+        if target_price is not None and entry_ceiling is not None and target_price <= entry_ceiling:
+            target_price = None
+            warnings.append("目标价不高于入场区间，已忽略")
+
+    p["entry_low"] = entry_low
+    p["entry_high"] = entry_high
+    p["stop_loss"] = stop_loss
+    p["target_price"] = target_price
+    if warnings:
+        p["warnings"] = warnings[:5]
+    elif "warnings" in p:
+        p.pop("warnings", None)
+    return p
+
+
 def _candidate_source_label(source: str) -> str:
     return CANDIDATE_SOURCE_LABELS.get((source or "").strip(), source or "")
 
@@ -560,11 +595,17 @@ def _strategy_labels(tags: list[str] | None) -> list[str]:
 def _plan_quality(plan: dict | None) -> int:
     p = plan if isinstance(plan, dict) else {}
     score = 0
-    if _safe_float(p.get("entry_low")) is not None or _safe_float(p.get("entry_high")) is not None:
+    entry_low = _safe_float(p.get("entry_low"))
+    entry_high = _safe_float(p.get("entry_high"))
+    stop_loss = _safe_float(p.get("stop_loss"))
+    target_price = _safe_float(p.get("target_price"))
+    entry_floor = entry_low if entry_low is not None else entry_high
+    entry_ceiling = entry_high if entry_high is not None else entry_low
+    if entry_low is not None or entry_high is not None:
         score += 30
-    if _safe_float(p.get("stop_loss")) is not None:
+    if stop_loss is not None and (entry_floor is None or stop_loss < entry_floor):
         score += 30
-    if _safe_float(p.get("target_price")) is not None:
+    if target_price is not None and (entry_ceiling is None or target_price > entry_ceiling):
         score += 30
     if str(p.get("invalidation") or "").strip():
         score += 10
@@ -977,8 +1018,8 @@ def _merge_market_scan_seed(
 
 def _load_market_scan_inputs(limit_per_market: int = 60) -> dict[str, dict]:
     collector = EastMoneyDiscoveryCollector(
-        timeout_s=12.0,
-        retries=1,
+        timeout_s=5.0,
+        retries=0,
         proxy=_resolve_market_scan_proxy(),
     )
     result: dict[str, dict] = {}
@@ -1474,6 +1515,7 @@ def refresh_entry_candidates(
                         continue
                     merged[k] = v
                 plan = merged
+            plan = _sanitize_plan(action, plan)
             quality = _plan_quality(plan)
             confidence = round(score / 100.0, 3)
 

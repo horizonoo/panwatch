@@ -213,6 +213,23 @@ class ContextMaintenanceScheduler:
         finally:
             self._refreshing = False
 
+    async def _optimize_job(self):
+        """每周回测优化: 重跑各市场最佳策略与出场参数，结果自动喂回模拟盘。"""
+        try:
+            from src.core.backtest.optimizer import run_optimization
+            with kline_source("backtest_optimize"):
+                report = await asyncio.to_thread(
+                    run_optimization,
+                    rounds=3, max_per_market=40, history_days=250,
+                    min_trades=8, persist=True,
+                )
+            logger.info(
+                "[上下文维护] 每周回测优化完成: 加载 %s 只，耗时 %ss",
+                report.bars_loaded, report.elapsed_sec,
+            )
+        except Exception as e:
+            logger.exception(f"[上下文维护] 每周回测优化异常: {e}")
+
     async def refresh_opportunities_once(self) -> dict:
         """手动触发一次机会刷新。"""
         with kline_source("refresh_opportunities"):
@@ -269,6 +286,19 @@ class ContextMaintenanceScheduler:
                 coalesce=True,
                 max_instances=1,
             )
+        # 每周回测优化（UTC 周日 18:30 = 北京周一 02:30，休市时段，结果自动喂回模拟盘）
+        self.scheduler.add_job(
+            self._optimize_job,
+            "cron",
+            day_of_week="sun",
+            hour=18,
+            minute=30,
+            jitter=300,
+            id="context_maintenance_weekly_optimize",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+        )
         # Run a bootstrap evaluation shortly after startup to warm up outcome stats.
         self.scheduler.add_job(
             self._evaluate_job,

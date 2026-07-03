@@ -1,0 +1,52 @@
+# 社交媒体监控配置
+# 此文件控制 social_digest Agent 抓取的账号、社区和关键词
+
+twitter:
+  enabled: true
+  tweet_count: 10  # 每个账号获取最近 N 条推文
+  accounts:
+    - handle: elonmusk
+      name: 马斯克
+      topics: [AI, Tesla, SpaceX, 科技政策, 美联储]
+    - handle: JensenHuang
+      name: 黄仁勋
+      topics: [GPU, AI, 英伟达, 数据中心]
+    - handle: sama
+      name: Sam Altman (OpenAI CEO)
+      topics: [AI, ChatGPT, OpenAI]
+    - handle: satyanadella
+      name: 纳德拉 (微软 CEO)
+      topics: [AI, 微软, 云计算]
+    - handle: realDonaldTrump
+      name: 特朗普
+      topics: [关税, 贸易政策, 美股]
+    - handle: federalreserve
+      name: 美联储官方
+      topics: [利率, 货币政策]
+    - handle: BillAckman
+      name: 比尔·阿克曼 (对冲基金)
+      topics: [宏观, 美股, 投资]
+
+reddit:
+  enabled: true
+  post_limit: 15  # 每个 subreddit 获取 Top N 帖子
+  subreddits:
+    - name: wallstreetbets
+      desc: 散户情绪风向标
+    - name: stocks
+      desc: 主流股票讨论
+    - name: investing
+      desc: 理性投资社区
+    - name: Semiconductors
+      desc: 半导体行业深度讨论
+    - name: nvidia
+      desc: 英伟达专区
+    - name: singularity
+      desc: AI 技术前沿
+    - name: MachineLearning
+      desc: AI/ML 研究动态
+
+xueqiu:
+  enabled: true
+  hot_limit: 20  # 雪球热帖数量
+  # 可选：在 AppSettings 配置 xueqiu_cookie 以获取更多内容

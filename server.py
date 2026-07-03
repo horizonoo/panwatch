@@ -41,6 +41,8 @@ from src.agents.chart_analyst import ChartAnalystAgent
 from src.agents.intraday_monitor import IntradayMonitorAgent
 from src.agents.premarket_outlook import PremarketOutlookAgent
 from src.agents.tradingagents import TradingAgentsAgent
+from src.agents.social_digest import SocialDigestAgent
+from src.agents.investment_intel import InvestmentIntelAgent
 
 logger = logging.getLogger(__name__)
 
@@ -352,6 +354,32 @@ def seed_agents():
 def seed_data_sources():
     """初始化预置数据源"""
     db = SessionLocal()
+
+    def generic_http_news_config(provider: str) -> dict:
+        return {
+            "description": f"{provider} 授权新闻网关。填写网关 URL、鉴权头和字段映射后启用。",
+            "url": "",
+            "method": "GET",
+            "headers": {
+                "Authorization": "",
+            },
+            "params": {
+                "limit": 50,
+            },
+            "json_body": {},
+            "items_path": "data.items",
+            "field_map": {
+                "id": "id",
+                "title": "title",
+                "content": "summary",
+                "time": "published_at",
+                "url": "url",
+                "symbols": "symbols",
+                "importance": "importance",
+            },
+            "timeout": 12,
+        }
+
     sources = [
         # 新闻类数据源
         {
@@ -386,6 +414,56 @@ def seed_data_sources():
             "priority": 2,
             "supports_batch": True,  # 支持批量查询
             "test_symbols": ["601127", "600519"],
+        },
+        {
+            "name": "华尔街见闻授权网关",
+            "type": "news",
+            "provider": "wallstreetcn",
+            "config": generic_http_news_config("wallstreetcn"),
+            "enabled": False,
+            "priority": 10,
+            "supports_batch": True,
+            "test_symbols": ["601127", "600519"],
+        },
+        {
+            "name": "金十授权网关",
+            "type": "news",
+            "provider": "jin10",
+            "config": generic_http_news_config("jin10"),
+            "enabled": False,
+            "priority": 11,
+            "supports_batch": True,
+            "test_symbols": ["601127", "600519"],
+        },
+        {
+            "name": "TradingView授权网关",
+            "type": "news",
+            "provider": "tradingview",
+            "config": generic_http_news_config("tradingview"),
+            "enabled": False,
+            "priority": 12,
+            "supports_batch": True,
+            "test_symbols": ["AAPL", "TSLA"],
+        },
+        {
+            "name": "Investing授权网关",
+            "type": "news",
+            "provider": "investing",
+            "config": generic_http_news_config("investing"),
+            "enabled": False,
+            "priority": 13,
+            "supports_batch": True,
+            "test_symbols": ["AAPL", "TSLA"],
+        },
+        {
+            "name": "富途授权网关",
+            "type": "news",
+            "provider": "futu",
+            "config": generic_http_news_config("futu"),
+            "enabled": False,
+            "priority": 14,
+            "supports_batch": True,
+            "test_symbols": ["00700", "AAPL"],
         },
         # K线数据源
         {
@@ -512,6 +590,8 @@ def seed_data_sources():
                 existing.supports_batch = source_data.get("supports_batch", False)
             if not existing.test_symbols:  # 只在空时更新
                 existing.test_symbols = source_data.get("test_symbols", [])
+            if source_data.get("config") and not existing.config:
+                existing.config = source_data.get("config", {})
         else:
             db.add(DataSource(**source_data))
 
@@ -869,6 +949,10 @@ def build_context(agent_name: str, stock_agent_id: int | None = None) -> AgentCo
     settings = Settings()
     watchlist = load_watchlist_for_agent(agent_name)
     portfolio = load_portfolio_for_agent(agent_name)
+    # 隐藏仓位开关：设置后 AI prompt 中不含持仓/资金信息
+    if _get_app_setting("hide_positions_from_ai") in ("1", "true", "yes"):
+        from src.agents.base import PortfolioInfo
+        portfolio = PortfolioInfo()
     proxy = _get_proxy() or settings.http_proxy
 
     model, service = resolve_ai_model(agent_name, stock_agent_id)
@@ -896,6 +980,8 @@ AGENT_REGISTRY: dict[str, type] = {
     "chart_analyst": ChartAnalystAgent,
     "intraday_monitor": IntradayMonitorAgent,
     "tradingagents": TradingAgentsAgent,
+    "social_digest": SocialDigestAgent,
+    "investment_intel": InvestmentIntelAgent,
 }
 
 
@@ -1261,42 +1347,82 @@ async def lifespan(app):
     threading.Thread(target=refresh_stock_cache, daemon=True).start()
 
     global scheduler, price_alert_scheduler, paper_trading_scheduler, context_maintenance_scheduler
-    scheduler = build_scheduler()
-    scheduler.start()
-    logger.info("Agent 调度器已启动")
-    try:
-        settings = Settings()
-        price_alert_scheduler = PriceAlertScheduler(
-            timezone=settings.app_timezone,
-            interval_seconds=60,
-        )
-        price_alert_scheduler.start()
-        logger.info("价格提醒调度器已启动")
-    except Exception as e:
-        logger.error(f"价格提醒调度器启动失败: {e}")
-    try:
-        settings = Settings()
-        paper_trading_scheduler = PaperTradingScheduler(
-            timezone=settings.app_timezone,
-            interval_seconds=60,
-        )
-        paper_trading_scheduler.start()
-        logger.info("模拟盘调度器已启动")
-    except Exception as e:
-        logger.error(f"模拟盘调度器启动失败: {e}")
-    try:
-        settings = Settings()
-        context_maintenance_scheduler = ContextMaintenanceScheduler(
-            timezone=settings.app_timezone,
-            eval_interval_hours=6,
-            snapshot_retention_days=180,
-            outcome_retention_days=365,
-        )
-        context_maintenance_scheduler.start()
-        logger.info("上下文维护调度器已启动")
-    except Exception as e:
-        logger.error(f"上下文维护调度器启动失败: {e}")
+    disable_agent_scheduler = os.getenv("PANWATCH_DISABLE_AGENT_SCHEDULER", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if disable_agent_scheduler:
+        logger.info("Agent 调度器已通过 PANWATCH_DISABLE_AGENT_SCHEDULER 禁用")
+    else:
+        scheduler = build_scheduler()
+        scheduler.start()
+        logger.info("Agent 调度器已启动")
+    disable_background_jobs = os.getenv("PANWATCH_DISABLE_BACKGROUND_JOBS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if disable_background_jobs:
+        logger.info("后台任务已通过 PANWATCH_DISABLE_BACKGROUND_JOBS 禁用")
+    else:
+        try:
+            settings = Settings()
+            price_alert_scheduler = PriceAlertScheduler(
+                timezone=settings.app_timezone,
+                interval_seconds=60,
+            )
+            price_alert_scheduler.start()
+            logger.info("价格提醒调度器已启动")
+        except Exception as e:
+            logger.error(f"价格提醒调度器启动失败: {e}")
+        try:
+            settings = Settings()
+            paper_trading_scheduler = PaperTradingScheduler(
+                timezone=settings.app_timezone,
+                interval_seconds=60,
+            )
+            paper_trading_scheduler.start()
+            logger.info("模拟盘调度器已启动")
+        except Exception as e:
+            logger.error(f"模拟盘调度器启动失败: {e}")
+        try:
+            settings = Settings()
+            context_maintenance_scheduler = ContextMaintenanceScheduler(
+                timezone=settings.app_timezone,
+                eval_interval_hours=6,
+                snapshot_retention_days=180,
+                outcome_retention_days=365,
+            )
+            context_maintenance_scheduler.start()
+            logger.info("上下文维护调度器已启动")
+        except Exception as e:
+            logger.error(f"上下文维护调度器启动失败: {e}")
+
+    # Telegram Bot 长轮询（有 token 时启动）
+    _tg_task = None
+    if disable_background_jobs:
+        logger.info("Telegram Bot 已通过 PANWATCH_DISABLE_BACKGROUND_JOBS 禁用")
+    else:
+        try:
+            from src.core.telegram_bot import build_bot
+            tg_bot = build_bot()
+            if tg_bot:
+                import asyncio
+                _tg_task = asyncio.create_task(tg_bot.poll_forever())
+                logger.info("Telegram Bot 已启动（长轮询）")
+            else:
+                logger.info("未配置 telegram_bot_token，跳过 Bot 启动")
+        except Exception as e:
+            logger.error(f"Telegram Bot 启动失败: {e}")
+
     yield
+
+    if _tg_task:
+        _tg_task.cancel()
+        logger.info("Telegram Bot 已关闭")
     if scheduler:
         scheduler.shutdown()
         logger.info("Agent 调度器已关闭")

@@ -172,6 +172,27 @@ export const tradingAgentsApi = {
     )
   },
 
+  /** 触发未入关注列表标的的深度分析。 */
+  triggerSymbol(
+    params: { symbol: string; market?: string; name?: string },
+    opts: { force?: boolean } = {},
+  ): Promise<TradingAgentsTriggerResult> {
+    const qsParts = [
+      'allow_unbound=true',
+      `symbol=${encodeURIComponent(params.symbol)}`,
+      `market=${encodeURIComponent(params.market || 'CN')}`,
+      `name=${encodeURIComponent(params.name || params.symbol)}`,
+    ]
+    if (opts.force) qsParts.push('force_refresh=true')
+    return fetchAPI(
+      `/stocks/0/agents/tradingagents/trigger?${qsParts.join('&')}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({}),
+      },
+    )
+  },
+
   /** 读取本月预算 + 单次预估成本(用于触发前确认弹窗)。 */
   getBudget(): Promise<BudgetInfo> {
     return fetchAPI('/agents/tradingagents/budget')

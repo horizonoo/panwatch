@@ -6,6 +6,7 @@ import { Label } from '@panwatch/base-ui/components/ui/label'
 import { Button } from '@panwatch/base-ui/components/ui/button'
 import { Switch } from '@panwatch/base-ui/components/ui/switch'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@panwatch/base-ui/components/ui/dialog'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@panwatch/base-ui/components/ui/select'
 import { useToast } from '@panwatch/base-ui/components/ui/toast'
 
 interface TestLogItem {
@@ -62,6 +63,42 @@ const emptyForm: DataSourceForm = {
   test_symbols: [],
 }
 
+const GENERIC_HTTP_NEWS_PROVIDERS = {
+  wallstreetcn: '华尔街见闻',
+  jin10: '金十',
+  tradingview: 'TradingView',
+  investing: 'Investing',
+  futu: '富途',
+} as const
+
+type GenericHttpNewsProvider = keyof typeof GENERIC_HTTP_NEWS_PROVIDERS
+
+const isGenericHttpNewsProvider = (provider: string): provider is GenericHttpNewsProvider =>
+  provider in GENERIC_HTTP_NEWS_PROVIDERS
+
+const genericHttpDefaults = (provider: string): Record<string, unknown> => ({
+  description: `${provider} 授权新闻网关。填写网关 URL、鉴权头和字段映射后启用。`,
+  url: '',
+  method: 'GET',
+  headers: { Authorization: '' },
+  params: { limit: 50 },
+  json_body: {},
+  items_path: 'data.items',
+  field_map: {
+    id: 'id',
+    title: 'title',
+    content: 'summary',
+    time: 'published_at',
+    url: 'url',
+    symbols: 'symbols',
+    importance: 'importance',
+  },
+  timeout: 12,
+})
+
+const asRecord = (value: unknown): Record<string, unknown> =>
+  value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
+
 export default function DataSourcesPage() {
   const [sources, setSources] = useState<DataSource[]>([])
   const [loading, setLoading] = useState(true)
@@ -91,11 +128,15 @@ export default function DataSourcesPage() {
 
   const openDialog = (source?: DataSource) => {
     if (source) {
+      const sourceConfig = source.config || {}
+      const config = source.type === 'news' && isGenericHttpNewsProvider(source.provider)
+        ? { ...genericHttpDefaults(source.provider), ...sourceConfig, field_map: { ...asRecord(genericHttpDefaults(source.provider).field_map), ...asRecord(sourceConfig.field_map) } }
+        : sourceConfig
       setForm({
         name: source.name,
         type: source.type,
         provider: source.provider,
-        config: source.config || {},
+        config,
         priority: source.priority,
         supports_batch: source.supports_batch || false,
         test_symbols: source.test_symbols || [],
@@ -108,6 +149,30 @@ export default function DataSourcesPage() {
       setEditId(null)
     }
     setDialogOpen(true)
+  }
+
+  const isGenericHttpNews = form.type === 'news' && isGenericHttpNewsProvider(form.provider)
+
+  const setConfigValue = (key: string, value: unknown) => {
+    setForm({ ...form, config: { ...form.config, [key]: value } })
+  }
+
+  const setHeaderValue = (key: string, value: string) => {
+    const headers = asRecord(form.config.headers)
+    setConfigValue('headers', { ...headers, [key]: value })
+  }
+
+  const setFieldMapValue = (key: string, value: string) => {
+    const fieldMap = asRecord(form.config.field_map)
+    setConfigValue('field_map', { ...fieldMap, [key]: value })
+  }
+
+  const setJsonConfigValue = (key: string, value: string) => {
+    try {
+      setConfigValue(key, value.trim() ? JSON.parse(value) : {})
+    } catch {
+      // 保留上一次有效配置，避免半输入时破坏表单状态。
+    }
   }
 
   const saveSource = async () => {
@@ -230,7 +295,7 @@ export default function DataSourcesPage() {
                           size="icon"
                           className="h-7 w-7"
                           onClick={() => testSource(source.id)}
-                          disabled={testing === source.id || !source.enabled}
+                          disabled={testing === source.id}
                           title="测试连接"
                         >
                           {testing === source.id ? (
@@ -311,6 +376,119 @@ export default function DataSourcesPage() {
                   onChange={e => setForm({ ...form, config: { ...form.config, cookies: e.target.value } })}
                   placeholder="xq_a_token=...; xq_r_token=...; ..."
                 />
+              </div>
+            )}
+            {isGenericHttpNews && (
+              <div className="space-y-4">
+                <div className="grid grid-cols-1 md:grid-cols-[1fr_120px] gap-3">
+                  <div>
+                    <Label>{GENERIC_HTTP_NEWS_PROVIDERS[form.provider as GenericHttpNewsProvider]} 网关 URL</Label>
+                    <Input
+                      value={(form.config?.url as string) || ''}
+                      onChange={e => setConfigValue('url', e.target.value)}
+                      placeholder="https://your-gateway.example.com/news"
+                    />
+                  </div>
+                  <div>
+                    <Label>请求方法</Label>
+                    <Select
+                      value={(form.config?.method as string) || 'GET'}
+                      onValueChange={value => setConfigValue('method', value)}
+                    >
+                      <SelectTrigger>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="GET">GET</SelectItem>
+                        <SelectItem value="POST">POST</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <div>
+                    <Label>Authorization Header</Label>
+                    <Input
+                      type="password"
+                      value={(asRecord(form.config?.headers).Authorization as string) || ''}
+                      onChange={e => setHeaderValue('Authorization', e.target.value)}
+                      placeholder="Bearer sk-... 或网关要求的授权值"
+                    />
+                  </div>
+                  <div>
+                    <Label>超时秒数</Label>
+                    <Input
+                      type="number"
+                      value={(form.config?.timeout as number) || 12}
+                      onChange={e => setConfigValue('timeout', Number(e.target.value) || 12)}
+                      min={1}
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <Label>列表路径</Label>
+                  <Input
+                    value={(form.config?.items_path as string) || 'data.items'}
+                    onChange={e => setConfigValue('items_path', e.target.value)}
+                    placeholder="例如 data.items、items、data.list"
+                  />
+                </div>
+
+                <div>
+                  <Label>字段映射</Label>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2 mt-1">
+                    {[
+                      ['id', '唯一 ID 路径'],
+                      ['title', '标题路径'],
+                      ['content', '摘要/正文路径'],
+                      ['time', '发布时间路径'],
+                      ['url', '原文链接路径'],
+                      ['symbols', '股票代码路径'],
+                      ['importance', '重要性路径'],
+                    ].map(([key, label]) => (
+                      <Input
+                        key={key}
+                        value={(asRecord(form.config?.field_map)[key] as string) || ''}
+                        onChange={e => setFieldMapValue(key, e.target.value)}
+                        placeholder={label}
+                      />
+                    ))}
+                  </div>
+                </div>
+
+                <details className="text-[12px]">
+                  <summary className="cursor-pointer text-muted-foreground hover:text-foreground">
+                    高级:请求参数、额外 Headers 和 POST Body
+                  </summary>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mt-2">
+                    <div>
+                      <Label>Params JSON</Label>
+                      <textarea
+                        className="mt-1 w-full font-mono text-[11px] p-2 border border-border rounded bg-background min-h-[88px]"
+                        value={JSON.stringify(form.config?.params || {}, null, 2)}
+                        onChange={e => setJsonConfigValue('params', e.target.value)}
+                      />
+                    </div>
+                    <div>
+                      <Label>Headers JSON</Label>
+                      <textarea
+                        className="mt-1 w-full font-mono text-[11px] p-2 border border-border rounded bg-background min-h-[88px]"
+                        value={JSON.stringify(form.config?.headers || {}, null, 2)}
+                        onChange={e => setJsonConfigValue('headers', e.target.value)}
+                      />
+                    </div>
+                    <div>
+                      <Label>JSON Body</Label>
+                      <textarea
+                        className="mt-1 w-full font-mono text-[11px] p-2 border border-border rounded bg-background min-h-[88px]"
+                        value={JSON.stringify(form.config?.json_body || {}, null, 2)}
+                        onChange={e => setJsonConfigValue('json_body', e.target.value)}
+                      />
+                    </div>
+                  </div>
+                </details>
               </div>
             )}
 
@@ -438,11 +616,33 @@ export default function DataSourcesPage() {
 
                   {/* News type */}
                   {testResult.source_type === 'news' && testResult.items.map((item, i) => {
-                    const newsItem = item as { title?: string; time?: string }
+                    const newsItem = item as { title?: string; content?: string; time?: string; source?: string; url?: string }
                     return (
-                      <div key={i} className="flex items-start gap-2 p-2 rounded-lg bg-accent/30">
-                        <span className="text-[12px] text-foreground flex-1">{newsItem.title}</span>
-                        <span className="text-[11px] text-muted-foreground flex-shrink-0">{newsItem.time}</span>
+                      <div key={i} className="p-2 rounded-lg bg-accent/30">
+                        <div className="flex items-start gap-2">
+                          <span className="text-[12px] text-foreground flex-1">{newsItem.title}</span>
+                          <span className="text-[11px] text-muted-foreground flex-shrink-0">{newsItem.time}</span>
+                        </div>
+                        {(newsItem.source || newsItem.url) && (
+                          <div className="mt-1 flex items-center gap-2 text-[10px] text-muted-foreground">
+                            {newsItem.source && <span className="font-mono">{newsItem.source}</span>}
+                            {newsItem.url && (
+                              <a
+                                className="text-primary hover:underline truncate"
+                                href={newsItem.url}
+                                target="_blank"
+                                rel="noreferrer"
+                              >
+                                原文链接
+                              </a>
+                            )}
+                          </div>
+                        )}
+                        {newsItem.content && (
+                          <div className="mt-1 text-[11px] text-muted-foreground line-clamp-2">
+                            {newsItem.content}
+                          </div>
+                        )}
                       </div>
                     )
                   })}

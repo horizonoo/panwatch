@@ -1049,6 +1049,156 @@ class PaperTradingTrade(Base):
     meta = Column(JSON, default={})
 
 
+class RealTradeLot(Base):
+    """真实账户买入分仓记录"""
+
+    __tablename__ = "real_trade_lots"
+    __table_args__ = (
+        Index("ix_real_lot_symbol", "stock_symbol", "stock_market"),
+        Index("ix_real_lot_bought_at", "bought_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    stock_symbol = Column(String, nullable=False)
+    stock_market = Column(String, nullable=False, default="CN")
+    stock_name = Column(String, default="")
+    quantity = Column(Float, nullable=False)
+    buy_price = Column(Float, nullable=False)
+    commission = Column(Float, nullable=False, default=0.0)
+    bought_at = Column(DateTime, nullable=False)
+    note = Column(String, default="")
+    status = Column(String, nullable=False, default="open")  # open / closed / partial
+    remaining_qty = Column(Float, nullable=False, default=0.0)  # 剩余未平仓数量
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    sells = relationship("RealTradeSell", back_populates="lot", cascade="all, delete-orphan")
+
+
+class RealTradeSell(Base):
+    """真实账户卖出记录（关联到买入分仓）"""
+
+    __tablename__ = "real_trade_sells"
+    __table_args__ = (
+        Index("ix_real_sell_lot", "lot_id"),
+        Index("ix_real_sell_sold_at", "sold_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    lot_id = Column(Integer, ForeignKey("real_trade_lots.id"), nullable=False)
+    stock_symbol = Column(String, nullable=False)
+    stock_market = Column(String, nullable=False, default="CN")
+    stock_name = Column(String, default="")
+    quantity = Column(Float, nullable=False)
+    sell_price = Column(Float, nullable=False)
+    commission = Column(Float, nullable=False, default=0.0)
+    sold_at = Column(DateTime, nullable=False)
+    note = Column(String, default="")
+    # 计算字段（存库方便查询）
+    sell_currency = Column(String, default="")              # 卖出货币（USD/HKD/CNY）
+    pnl = Column(Float, nullable=False, default=0.0)       # 盈亏金额（含手续费，原币）
+    pnl_pct = Column(Float, nullable=False, default=0.0)   # 盈亏率
+    holding_days = Column(Integer, default=0)
+    created_at = Column(DateTime, server_default=func.now())
+
+    lot = relationship("RealTradeLot", back_populates="sells")
+
+
+class TradeReview(Base):
+    """交易复盘记录，用于沉淀系统建议的人工反馈。"""
+
+    __tablename__ = "trade_reviews"
+    __table_args__ = (
+        Index("ix_trade_reviews_symbol", "stock_symbol", "stock_market"),
+        Index("ix_trade_reviews_strategy", "strategy_code", "created_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    source = Column(String, nullable=False, default="manual")  # paper/real/manual
+    source_id = Column(Integer, nullable=True)
+    stock_symbol = Column(String, nullable=False)
+    stock_market = Column(String, nullable=False, default="US")
+    stock_name = Column(String, default="")
+    strategy_code = Column(String, default="")
+    strategy_name = Column(String, default="")
+    action_taken = Column(String, default="")
+    thesis = Column(Text, default="")
+    result = Column(String, default="unknown")  # win/loss/flat/unknown
+    pnl_pct = Column(Float, nullable=True)
+    mistake_tags = Column(JSON, default=[])
+    improvement = Column(Text, default="")
+    confidence_before = Column(Float, nullable=True)
+    confidence_after = Column(Float, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class TradeIdea(Base):
+    """事前交易思路记录：从长文本提炼配对/期权计划与执行检查。"""
+
+    __tablename__ = "trade_ideas"
+    __table_args__ = (
+        Index("ix_trade_ideas_status", "status", "created_at"),
+        Index("ix_trade_ideas_strategy", "strategy_type", "created_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    title = Column(String, nullable=False, default="")
+    source = Column(String, default="manual")
+    raw_text = Column(Text, default="")
+    thesis = Column(Text, default="")
+    strategy_type = Column(String, default="pair_options")
+    status = Column(String, default="watching")  # watching/ready/open/closed/archived
+    conviction = Column(String, default="medium")  # low/medium/high
+    event_date = Column(String, default="")  # YYYY-MM-DD
+    entry_start = Column(String, default="")
+    entry_end = Column(String, default="")
+    legs = Column(JSON, default=[])
+    plan = Column(JSON, default={})
+    catalysts = Column(JSON, default=[])
+    risk_checks = Column(JSON, default=[])
+    data_sources = Column(JSON, default=[])
+    metrics = Column(JSON, default={})
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class TradeIdeaScoreModel(Base):
+    """交易思路评分模型配置。"""
+
+    __tablename__ = "trade_idea_score_models"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    model_key = Column(String, unique=True, nullable=False)
+    label = Column(String, nullable=False, default="")
+    weights = Column(JSON, default={})
+    enabled = Column(Boolean, default=True)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class StrategyRuleInsight(Base):
+    """从历史结果和人工复盘生成的策略改进建议。"""
+
+    __tablename__ = "strategy_rule_insights"
+    __table_args__ = (
+        Index("ix_rule_insights_scope", "scope_type", "scope_key", "status"),
+        Index("ix_rule_insights_strategy", "strategy_code", "stock_market"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    scope_type = Column(String, nullable=False, default="strategy")  # strategy/market/symbol/global
+    scope_key = Column(String, nullable=False, default="")
+    stock_market = Column(String, default="")
+    strategy_code = Column(String, default="")
+    severity = Column(String, nullable=False, default="info")  # info/warn/block
+    title = Column(String, nullable=False, default="")
+    recommendation = Column(Text, nullable=False, default="")
+    evidence = Column(JSON, default={})
+    status = Column(String, nullable=False, default="active")  # active/archived
+    generated_at = Column(DateTime, server_default=func.now())
+
+
 class ChatConversation(Base):
     """AI 对话会话"""
 

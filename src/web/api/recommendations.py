@@ -17,6 +17,9 @@ from src.core.entry_candidates import (
 from src.core.strategy_catalog import list_strategy_catalog
 from src.core.strategy_engine import (
     evaluate_strategy_outcomes,
+    get_accuracy_trend,
+    get_confidence_calibration,
+    get_stock_signal_history,
     get_strategy_factor_snapshot,
     get_strategy_stats,
     list_market_regime_snapshots,
@@ -29,7 +32,13 @@ from src.core.strategy_engine import (
 from src.core.factor_eval import evaluate_factor_ic
 from src.core.signal_explain import enrich_signal
 from src.web.database import SessionLocal
-from src.web.models import StrategySignalRun
+from src.web.models import (
+    PaperTradingPosition,
+    PaperTradingTrade,
+    StrategyRuleInsight,
+    StrategyOutcome,
+    StrategySignalRun,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -385,3 +394,556 @@ def strategy_weight_history(
         market=market,
         limit=limit,
     )
+
+
+@router.get("/strategy-accuracy-trend")
+def strategy_accuracy_trend(
+    days: int = Query(180, ge=7, le=730),
+    horizon: int = Query(3, ge=1, le=60),
+    strategy_code: str = Query(""),
+    market: str = Query(""),
+    granularity: str = Query("week", regex="^(week|month)$"),
+):
+    """按周/月粒度返回历史胜率趋势。"""
+    return get_accuracy_trend(
+        days=days,
+        strategy_code=strategy_code,
+        market=market,
+        horizon=horizon,
+        granularity=granularity,
+    )
+
+
+@router.get("/strategy-confidence-calibration")
+def strategy_confidence_calibration(
+    days: int = Query(180, ge=7, le=730),
+    horizon: int = Query(3, ge=1, le=60),
+    market: str = Query(""),
+):
+    """按信心度分桶，返回各桶实际胜率。"""
+    return get_confidence_calibration(
+        days=days,
+        horizon=horizon,
+        market=market,
+    )
+
+
+@router.get("/stock-signal-history")
+def stock_signal_history(
+    symbol: str = Query(..., description="股票代码"),
+    market: str = Query("CN", description="市场 CN/HK/US"),
+    days: int = Query(180, ge=7, le=730),
+    horizon: int = Query(3, ge=1, le=60),
+):
+    """某只股票的历史信号及后验涨跌结果。"""
+    return get_stock_signal_history(
+        symbol=symbol,
+        market=market,
+        days=days,
+        horizon=horizon,
+    )
+
+
+def _num(v, default=0.0) -> float:
+    try:
+        if v is None:
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+
+def _plan_prices(signal: StrategySignalRun) -> dict:
+    entry_low = signal.entry_low
+    entry_high = signal.entry_high
+    entry_mid = None
+    if entry_low is not None and entry_high is not None:
+        entry_mid = (float(entry_low) + float(entry_high)) / 2
+    elif entry_low is not None:
+        entry_mid = float(entry_low)
+    elif entry_high is not None:
+        entry_mid = float(entry_high)
+    stop = signal.stop_loss
+    target = signal.target_price
+    risk_reward = None
+    if entry_mid and stop and target:
+        risk = entry_mid - float(stop)
+        reward = float(target) - entry_mid
+        if risk > 0 and reward > 0:
+            risk_reward = round(reward / risk, 2)
+    return {
+        "entry_low": entry_low,
+        "entry_high": entry_high,
+        "entry_mid": entry_mid,
+        "stop_loss": stop,
+        "target_price": target,
+        "risk_reward": risk_reward,
+        "holding_days": signal.holding_days or 3,
+    }
+
+
+def _strategy_operability(db, signal: StrategySignalRun, days: int, horizon: int) -> dict:
+    since = datetime.now(timezone.utc).replace(tzinfo=None)
+    # SQLite DateTime 可能是 naive，按 created_at 窗口过滤时用简单天数近似。
+    from datetime import timedelta
+    since = since - timedelta(days=int(days))
+    q = (
+        db.query(StrategyOutcome)
+        .filter(
+            StrategyOutcome.strategy_code == signal.strategy_code,
+            StrategyOutcome.stock_market == signal.stock_market,
+            StrategyOutcome.horizon_days == int(horizon),
+            StrategyOutcome.outcome_status.in_(("evaluated", "hit_target", "hit_stop")),
+            StrategyOutcome.created_at >= since,
+        )
+    )
+    rows = q.all()
+    total = len(rows)
+    wins = sum(1 for r in rows if _num(r.outcome_return_pct) > 0)
+    hit_target = sum(1 for r in rows if bool(r.hit_target))
+    hit_stop = sum(1 for r in rows if bool(r.hit_stop))
+    returns = [_num(r.outcome_return_pct) for r in rows if r.outcome_return_pct is not None]
+    avg_ret = sum(returns) / len(returns) if returns else 0.0
+    worst_ret = min(returns) if returns else 0.0
+    best_ret = max(returns) if returns else 0.0
+
+    stock_rows = (
+        db.query(StrategyOutcome)
+        .filter(
+            StrategyOutcome.stock_symbol == signal.stock_symbol,
+            StrategyOutcome.stock_market == signal.stock_market,
+            StrategyOutcome.horizon_days == int(horizon),
+            StrategyOutcome.outcome_status.in_(("evaluated", "hit_target", "hit_stop")),
+            StrategyOutcome.created_at >= since,
+        )
+        .all()
+    )
+    stock_returns = [_num(r.outcome_return_pct) for r in stock_rows if r.outcome_return_pct is not None]
+    stock_wins = sum(1 for r in stock_rows if _num(r.outcome_return_pct) > 0)
+    return {
+        "window_days": days,
+        "horizon_days": horizon,
+        "strategy_samples": total,
+        "strategy_win_rate": round(wins / total, 4) if total else 0.0,
+        "target_hit_rate": round(hit_target / total, 4) if total else 0.0,
+        "stop_hit_rate": round(hit_stop / total, 4) if total else 0.0,
+        "avg_return_pct": round(avg_ret, 2),
+        "best_return_pct": round(best_ret, 2),
+        "worst_return_pct": round(worst_ret, 2),
+        "stock_samples": len(stock_rows),
+        "stock_win_rate": round(stock_wins / len(stock_rows), 4) if stock_rows else 0.0,
+        "stock_avg_return_pct": round(sum(stock_returns) / len(stock_returns), 2) if stock_returns else 0.0,
+    }
+
+
+def _debate(signal: StrategySignalRun) -> dict:
+    payload = signal.payload if isinstance(signal.payload, dict) else {}
+    breakdown = payload.get("score_breakdown") if isinstance(payload.get("score_breakdown"), dict) else {}
+    news_metric = payload.get("news_metric") if isinstance(payload.get("news_metric"), dict) else {}
+    market_regime = payload.get("market_regime") if isinstance(payload.get("market_regime"), dict) else {}
+    cross_feature = payload.get("cross_feature") if isinstance(payload.get("cross_feature"), dict) else {}
+    evidence = signal.evidence or []
+    bulls: list[str] = []
+    bears: list[str] = []
+    if signal.signal:
+        bulls.append(signal.signal)
+    for ev in evidence[:3]:
+        if ev:
+            bulls.append(str(ev))
+    if _num(breakdown.get("alpha_score")) >= 65:
+        bulls.append(f"Alpha 得分较强: {breakdown.get('alpha_score')}")
+    if _num(breakdown.get("catalyst_score")) >= 65:
+        bulls.append(f"催化得分较强: {breakdown.get('catalyst_score')}")
+    if _num(news_metric.get("event_score")) >= 60:
+        bulls.append(f"新闻/事件偏强: {news_metric.get('event_score')}")
+    if _num(cross_feature.get("relative_strength_pct")) >= 70:
+        bulls.append(f"相对强弱处于高分位: {cross_feature.get('relative_strength_pct')}")
+    if _num(breakdown.get("risk_penalty")) > 15:
+        bears.append(f"风险惩罚偏高: {breakdown.get('risk_penalty')}")
+    if signal.risk_level == "high":
+        bears.append("风险等级较高，需降低仓位或等待确认")
+    if market_regime.get("regime") == "bearish":
+        bears.append(f"市场状态偏空: {market_regime.get('regime_label') or 'bearish'}")
+    if not signal.entry_low and not signal.entry_high:
+        bears.append("缺少明确入场区间，不宜追单")
+    if signal.invalidation:
+        bears.append(f"失效条件: {signal.invalidation}")
+    return {
+        "bulls": list(dict.fromkeys(bulls))[:6],
+        "bears": list(dict.fromkeys(bears))[:6],
+        "key_disagreement": "价格能否进入计划买入区间并守住止损线",
+        "verdict": signal.action_label or signal.action or "观望",
+    }
+
+
+def _option_advice(
+    db,
+    signal: StrategySignalRun,
+    plan: dict,
+    operability: dict,
+    *,
+    current_price: float | None = None,
+    iv_rank: float | None = None,
+    holding_qty: int = 0,
+    risk_budget_pct: float = 2.0,
+) -> dict:
+    """生成个股级股票+期权操作建议。
+
+    没有真实期权链时只输出结构和筛选条件；接入链后再把条件落到具体合约。
+    """
+    entry_low = _num(plan.get("entry_low"), 0.0)
+    entry_high = _num(plan.get("entry_high"), 0.0)
+    entry_mid = _num(plan.get("entry_mid"), 0.0)
+    stop = _num(plan.get("stop_loss"), 0.0)
+    target = _num(plan.get("target_price"), 0.0)
+    px = _num(current_price, 0.0) or entry_mid or entry_low or entry_high
+    market = (signal.stock_market or "").upper()
+    action = (signal.action or "").lower()
+    confidence = _num(signal.confidence, _num(signal.rank_score, 0.0) / 100.0)
+    win_rate = _num(operability.get("strategy_win_rate"), 0.0)
+    avg_return = _num(operability.get("avg_return_pct"), 0.0)
+    samples = int(_num(operability.get("strategy_samples"), 0.0))
+
+    can_price = bool(px and stop and target and target > px > stop)
+    reward = max(0.0, target - px) if px and target else 0.0
+    risk = max(0.0, px - stop) if px and stop else 0.0
+    rr = round(reward / risk, 2) if risk > 0 else None
+    upside_pct = round(reward / px * 100, 2) if px and reward else 0.0
+    downside_pct = round(risk / px * 100, 2) if px and risk else 0.0
+
+    if action in ("sell", "reduce"):
+        stance = "bearish"
+    elif action in ("buy", "add") and confidence >= 0.6 and avg_return >= 0:
+        stance = "bullish"
+    elif action in ("buy", "add"):
+        stance = "cautious_bullish"
+    else:
+        stance = "neutral"
+
+    if entry_low and entry_high and px:
+        if px < stop:
+            stock_action = "avoid_or_exit"
+            stock_text = "价格已跌破止损线，先退出/不新开仓。"
+        elif px < entry_low:
+            stock_action = "wait"
+            stock_text = f"等待回到入场区间 {entry_low:g}-{entry_high:g}，不提前追。"
+        elif px <= entry_high:
+            stock_action = "buy_or_hold" if stance.startswith("bullish") else "small_probe"
+            stock_text = "价格在计划区间内，可按风险预算分批执行。"
+        elif px <= entry_high * 1.02:
+            stock_action = "small_probe"
+            stock_text = "略高于入场区间，只允许小仓试单，回落再补。"
+        else:
+            stock_action = "no_chase"
+            stock_text = "价格明显高于入场区间，放弃追高，等回踩或新信号。"
+    else:
+        stock_action = "wait"
+        stock_text = "缺少完整入场区间，先观察，等系统生成明确价格。"
+
+    if samples < 8:
+        conviction = "low"
+    elif confidence >= 0.75 and win_rate >= 0.55 and avg_return > 0 and (rr or 0) >= 1.5:
+        conviction = "high"
+    elif confidence >= 0.6 and avg_return >= 0:
+        conviction = "medium"
+    else:
+        conviction = "low"
+
+    active_rules = (
+        db.query(StrategyRuleInsight)
+        .filter(
+            StrategyRuleInsight.status == "active",
+            StrategyRuleInsight.scope_type.in_(("strategy", "global")),
+        )
+        .order_by(StrategyRuleInsight.generated_at.desc())
+        .limit(50)
+        .all()
+    )
+    matched_rules: list[dict] = []
+    for r in active_rules:
+        strategy_match = (
+            r.scope_type == "strategy"
+            and (not r.strategy_code or r.strategy_code == signal.strategy_code)
+            and (not r.stock_market or r.stock_market == signal.stock_market)
+        )
+        global_match = r.scope_type == "global"
+        if strategy_match or global_match:
+            matched_rules.append({
+                "severity": r.severity,
+                "title": r.title,
+                "recommendation": r.recommendation,
+            })
+    if any(r["severity"] == "block" for r in matched_rules):
+        conviction = "low"
+        stock_action = "wait"
+        stock_text = "学习规则触发拦截：该类信号近期表现偏弱，先等待右侧确认，不自动开仓。"
+    elif any(r["severity"] == "warn" for r in matched_rules) and conviction == "high":
+        conviction = "medium"
+
+    optionable = market == "US"
+    data_needed = [
+        "标的实时价/最新成交价",
+        "可交易到期日列表",
+        "每个合约的 bid、ask、last、volume、open interest",
+        "Delta、IV、IV Rank/Percentile",
+        "财报/上市/解禁等事件日期",
+        "你的账户期权权限、最大可亏损金额、是否允许价差单",
+    ]
+    if not optionable:
+        data_needed.insert(1, "若是港股/韩股，请确认券商是否提供该标的期权；多数情况下需要用 ADR/美股替代品做期权腿")
+
+    expiry = "45-75 天"
+    if iv_rank is not None and iv_rank >= 60:
+        bullish_structure = "Call Debit Spread"
+        bullish_detail = "买入 Delta 0.45-0.60 的 Call，卖出目标价附近或 Delta 0.20-0.35 的 Call；最大亏损=净权利金。"
+    else:
+        bullish_structure = "Long Call 或 Call Debit Spread"
+        bullish_detail = "若 IV 不贵可买入 Delta 0.45-0.60 Call；若权利金偏贵，改用 Call Debit Spread 降低成本。"
+
+    if stance in ("bearish", "neutral"):
+        primary = {
+            "name": "Put Debit Spread",
+            "direction": "看跌/保护",
+            "expiry": expiry,
+            "instruction": "买入接近平值 Put，卖出下方支撑/目标跌幅位置 Put；最大亏损=净权利金。",
+            "use_when": "用于破位、减仓保护，或对冲同板块多头仓位。",
+        }
+    elif holding_qty > 0 and stance.startswith("bullish"):
+        primary = {
+            "name": "Covered Call + Protective Put 备兑增强/保护",
+            "direction": "持仓管理",
+            "expiry": "30-60 天",
+            "instruction": "持有正股时，可在目标价上方卖 Delta 0.20-0.30 Call；若仓位过重，同时买入止损线附近 Put 做灾难保护。",
+            "use_when": "适合已有持仓、想锁定一部分收益，同时保留核心仓位。",
+        }
+    else:
+        primary = {
+            "name": bullish_structure,
+            "direction": "看涨",
+            "expiry": expiry,
+            "instruction": bullish_detail,
+            "use_when": "价格进入入场区间，且相对强弱/成交量确认时执行。",
+        }
+
+    hedge = {
+        "name": "Pair Hedge 配对对冲",
+        "direction": "相对强弱",
+        "instruction": "若逻辑是某只股票跑赢同产业链高估值标的，可用目标股票 Call Spread + 对手股票 Put Spread；两腿最大亏损按 1:1 或 2:1 风险预算匹配。",
+        "use_when": "适合 HBM/存储这类同产业链估值差交易，避免只暴露行业 beta。",
+    }
+
+    return {
+        "available": True,
+        "data_status": "needs_option_chain",
+        "optionable_guess": optionable,
+        "stance": stance,
+        "conviction": conviction,
+        "price_snapshot": {
+            "current_price": px or None,
+            "entry_low": plan.get("entry_low"),
+            "entry_high": plan.get("entry_high"),
+            "stop_loss": plan.get("stop_loss"),
+            "target_price": plan.get("target_price"),
+            "upside_pct": upside_pct,
+            "downside_pct": downside_pct,
+            "risk_reward": rr,
+            "can_price": can_price,
+        },
+        "stock_instruction": {
+            "action": stock_action,
+            "text": stock_text,
+            "risk_budget_pct": min(max(float(risk_budget_pct or 2.0), 0.2), 5.0),
+            "stop_rule": f"跌破 {stop:g} 退出/不补仓" if stop else "缺少止损价，禁止重仓",
+            "target_rule": f"接近 {target:g} 分批止盈" if target else "缺少目标价，先按移动止盈",
+        },
+        "option_instruction": primary,
+        "hedge_instruction": hedge,
+        "checklist": [
+            "先确认价格是否在入场区间，不追高。",
+            "先算最大亏损，再决定合约数量。",
+            "优先价差单，少用裸买极虚值期权。",
+            "Bid/Ask 价差超过权利金 8%-10% 时不下单。",
+            "事件日前后 IV 很高时，避免单纯买跨或裸买贵期权。",
+        ],
+        "learning_rules": matched_rules[:5],
+        "data_needed": data_needed,
+    }
+
+
+def _paper_follow(db, signal: StrategySignalRun) -> dict:
+    pos = (
+        db.query(PaperTradingPosition)
+        .filter(
+            PaperTradingPosition.stock_symbol == signal.stock_symbol,
+            PaperTradingPosition.stock_market == signal.stock_market,
+            PaperTradingPosition.status == "open",
+        )
+        .order_by(PaperTradingPosition.opened_at.desc())
+        .first()
+    )
+    trades = (
+        db.query(PaperTradingTrade)
+        .filter(
+            PaperTradingTrade.stock_symbol == signal.stock_symbol,
+            PaperTradingTrade.stock_market == signal.stock_market,
+        )
+        .order_by(PaperTradingTrade.closed_at.desc())
+        .limit(10)
+        .all()
+    )
+    closed = len(trades)
+    wins = sum(1 for t in trades if _num(t.pnl) > 0)
+    return {
+        "open_position": {
+            "id": pos.id,
+            "quantity": pos.quantity,
+            "entry_price": pos.entry_price,
+            "current_price": pos.current_price,
+            "stop_loss": pos.stop_loss,
+            "target_price": pos.target_price,
+            "unrealized_pnl": round(_num(pos.unrealized_pnl), 2),
+            "strategy_code": pos.strategy_code or "",
+            "opened_at": pos.opened_at.isoformat() if pos.opened_at else "",
+        } if pos else None,
+        "recent_closed": closed,
+        "recent_win_rate": round(wins / closed, 4) if closed else 0.0,
+        "recent_avg_pnl_pct": round(sum(_num(t.pnl_pct) for t in trades) / closed, 2) if closed else 0.0,
+    }
+
+
+@router.get("/trade-plan")
+def trade_plan(
+    symbol: str = Query(..., description="股票代码"),
+    market: str = Query("CN", description="市场 CN/HK/US"),
+    days: int = Query(180, ge=7, le=730),
+    horizon: int = Query(3, ge=1, le=60),
+    current_price: float | None = Query(None, description="可选: 当前价，用于刷新个股指令"),
+    iv_rank: float | None = Query(None, ge=0, le=100, description="可选: IV Rank/Percentile"),
+    holding_qty: int = Query(0, ge=0, description="可选: 当前持仓数量"),
+):
+    """聚合交易计划、历史可操作性、多空博弈与模拟盘跟进。"""
+    db = SessionLocal()
+    try:
+        signal = (
+            db.query(StrategySignalRun)
+            .filter(
+                StrategySignalRun.stock_symbol == symbol,
+                StrategySignalRun.stock_market == market,
+            )
+            .order_by(StrategySignalRun.snapshot_date.desc(), StrategySignalRun.rank_score.desc())
+            .first()
+        )
+        if not signal:
+            return {"available": False, "symbol": symbol, "market": market}
+        enrich_payload = {
+            "id": signal.id,
+            "snapshot_date": signal.snapshot_date,
+            "stock_symbol": signal.stock_symbol,
+            "stock_market": signal.stock_market,
+            "stock_name": signal.stock_name,
+            "strategy_code": signal.strategy_code,
+            "strategy_name": signal.strategy_name,
+            "rank_score": signal.rank_score,
+            "action": signal.action,
+            "action_label": signal.action_label,
+            "signal": signal.signal,
+            "reason": signal.reason,
+            "risk_level": signal.risk_level,
+            "invalidation": signal.invalidation,
+        }
+        enrich_signal(enrich_payload)
+        plan = _plan_prices(signal)
+        operability = _strategy_operability(db, signal, days, horizon)
+        return {
+            "available": True,
+            "signal": enrich_payload,
+            "plan": plan,
+            "operability": operability,
+            "debate": _debate(signal),
+            "paper_follow": _paper_follow(db, signal),
+            "options_advice": _option_advice(
+                db,
+                signal,
+                plan,
+                operability,
+                current_price=current_price,
+                iv_rank=iv_rank,
+                holding_qty=holding_qty,
+            ),
+        }
+    finally:
+        db.close()
+
+
+@router.get("/options-advice")
+def options_advice(
+    symbol: str = Query(..., description="股票代码"),
+    market: str = Query("US", description="市场 CN/HK/US"),
+    days: int = Query(180, ge=7, le=730),
+    horizon: int = Query(10, ge=1, le=90),
+    current_price: float | None = Query(None),
+    iv_rank: float | None = Query(None, ge=0, le=100),
+    holding_qty: int = Query(0, ge=0),
+    risk_budget_pct: float = Query(2.0, ge=0.2, le=5.0),
+):
+    """个股级股票+期权执行建议。
+
+    先使用系统已有交易计划和历史可操作性；没有真实期权链时输出可执行的合约筛选条件。
+    """
+    db = SessionLocal()
+    try:
+        signal = (
+            db.query(StrategySignalRun)
+            .filter(
+                StrategySignalRun.stock_symbol == symbol,
+                StrategySignalRun.stock_market == market,
+            )
+            .order_by(StrategySignalRun.snapshot_date.desc(), StrategySignalRun.rank_score.desc())
+            .first()
+        )
+        if not signal:
+            return {
+                "available": False,
+                "symbol": symbol,
+                "market": market,
+                "message": "暂无该标的交易计划，请先在机会页刷新策略信号或手动补充价格。",
+                "data_needed": [
+                    "当前价",
+                    "入场区间",
+                    "止损价",
+                    "目标价",
+                    "期权链 bid/ask、Delta、IV、成交量、未平仓量",
+                ],
+            }
+        plan = _plan_prices(signal)
+        operability = _strategy_operability(db, signal, days, horizon)
+        return {
+            "available": True,
+            "symbol": symbol,
+            "market": market,
+            "signal": {
+                "id": signal.id,
+                "stock_name": signal.stock_name,
+                "strategy_code": signal.strategy_code,
+                "strategy_name": signal.strategy_name,
+                "rank_score": signal.rank_score,
+                "confidence": signal.confidence,
+                "action": signal.action,
+                "action_label": signal.action_label,
+                "reason": signal.reason,
+            },
+            "plan": plan,
+            "operability": operability,
+            "advice": _option_advice(
+                db,
+                signal,
+                plan,
+                operability,
+                current_price=current_price,
+                iv_rank=iv_rank,
+                holding_qty=holding_qty,
+                risk_budget_pct=risk_budget_pct,
+            ),
+        }
+    finally:
+        db.close()

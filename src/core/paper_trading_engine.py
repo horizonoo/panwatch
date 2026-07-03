@@ -19,11 +19,41 @@ from src.web.models import (
     PaperTradingTrade,
     StrategySignalRun,
 )
-from src.core.backtest.cost_model import CostModel
+from src.core.backtest.cost_model import CostModel, get_cost_model
+from src.core.backtest.optimizer import get_optimized_params
 
 logger = logging.getLogger(__name__)
 
-# 模拟盘交易成本(A股口径,Phase 1)。与回测共用同一成本模型。
+# 各市场出场参数兜底(无回测优化结果时使用): (止损%, 止盈%, 持有自然日)
+_LEGACY_EXIT_DEFAULTS = {
+    "CN": (0.08, 0.15, 20),
+    "HK": (0.08, 0.15, 20),
+    "US": (0.08, 0.15, 20),
+}
+
+
+# 风险收益比下限: 止盈 ≥ MIN_REWARD_RISK × 止损，防止极端不对称(高胜率堆小赢/一次大亏吃光)
+MIN_REWARD_RISK = 0.6
+
+
+def _effective_exit_params(market: str) -> tuple[float, float, int]:
+    """返回该市场生效的出场参数(止损%, 止盈%, 持有天数)。
+
+    优先用回测优化器找到的最优参数(get_optimized_params)，否则回退到传统默认值。
+    回测优化每跑一轮，模拟盘开仓的止损/止盈/持有自动跟着更新(按文件 mtime 缓存)。
+    末尾强制风险收益比下限: 止盈不低于止损的 MIN_REWARD_RISK 倍。
+    """
+    market = (market or "CN").upper()
+    opt = get_optimized_params(market)
+    if opt and opt.get("stop_pct") and opt.get("target_pct") and opt.get("holding_days"):
+        stop_pct, target_pct, hold = float(opt["stop_pct"]), float(opt["target_pct"]), int(opt["holding_days"])
+    else:
+        stop_pct, target_pct, hold = _LEGACY_EXIT_DEFAULTS.get(market, (0.08, 0.15, 20))
+    # 安全下限: 止盈至少为止损的 0.6 倍，避免冒大险赚小钱
+    target_pct = max(target_pct, round(MIN_REWARD_RISK * stop_pct, 4))
+    return stop_pct, target_pct, hold
+
+# 模拟盘交易成本（A股默认，港股/美股通过 get_cost_model(market) 获取对应模型）
 COST_MODEL = CostModel()
 
 # 建仓股数下限(A股一手)
@@ -351,6 +381,9 @@ class PaperTradingEngine:
                 continue  # 该市场比例为 0，不投入
             avail = market_cash.get(mkt, 0.0)
 
+            # 按市场选对应成本模型（A股/港股/美股费率不同）
+            cost_model = get_cost_model(mkt)
+
             # 仓位管理:按信号强度分配该市场预算(替换原固定 100 股)
             market_budget = account.initial_capital * alloc.get(mkt, 0.0)
             quantity = _compute_quantity(
@@ -358,17 +391,18 @@ class PaperTradingEngine:
                 market_budget=market_budget,
                 price=entry_price,
                 available_cash=avail,
-                cost_model=COST_MODEL,
+                cost_model=cost_model,
             )
             if quantity <= 0:
                 continue  # 子池额度不足以买入最小一手
 
             # 含交易成本的实际买入流出
-            buy_fill = COST_MODEL.fill("buy", entry_price, quantity)
+            buy_fill = cost_model.fill("buy", entry_price, quantity)
             buy_outlay = -buy_fill.cash_delta
 
             # 基于入场价计算止损/止盈
-            # 优先用信号的止损/止盈比例，否则用默认 -8%/+15%
+            # 优先用信号自带的止损/止盈，否则用「回测优化的该市场最优参数」兜底
+            opt_stop_pct, opt_target_pct, _opt_hold = _effective_exit_params(mkt)
             stop_loss = sig.stop_loss
             target_price = sig.target_price
             if stop_loss and sig.entry_low and sig.entry_low > 0:
@@ -376,15 +410,15 @@ class PaperTradingEngine:
                 orig_mid = (sig.entry_low + (sig.entry_high or sig.entry_low)) / 2
                 if orig_mid > 0:
                     stop_ratio = (stop_loss - orig_mid) / orig_mid
-                    target_ratio = ((target_price - orig_mid) / orig_mid) if target_price else 0.15
+                    target_ratio = ((target_price - orig_mid) / orig_mid) if target_price else opt_target_pct
                     stop_loss = round(entry_price * (1 + stop_ratio), 4)
                     target_price = round(entry_price * (1 + target_ratio), 4) if target_price else None
-            # 兜底：止损不合理时用默认 -8%
+            # 兜底：止损不合理时用回测最优止损%
             if not stop_loss or stop_loss <= 0 or stop_loss >= entry_price:
-                stop_loss = round(entry_price * 0.92, 4)
-            # 兜底：止盈不合理时用默认 +15%
+                stop_loss = round(entry_price * (1 - opt_stop_pct), 4)
+            # 兜底：止盈不合理时用回测最优止盈%
             if not target_price or target_price <= 0 or target_price <= entry_price:
-                target_price = round(entry_price * 1.15, 4)
+                target_price = round(entry_price * (1 + opt_target_pct), 4)
 
             pos = PaperTradingPosition(
                 stock_symbol=sig.stock_symbol,
@@ -436,9 +470,11 @@ class PaperTradingEngine:
     ) -> PaperTradingTrade:
         """平仓单个持仓，返回交易记录。"""
         now = _utc_now()
+        # 按市场选对应成本模型（A股/港股/美股费率不同）
+        cost_model = get_cost_model(pos.stock_market or "CN")
         # 含交易成本的净盈亏:卖出净回收 − 建仓含费投入(与建仓口径一致,资金守恒)
-        buy_cost = -COST_MODEL.fill("buy", pos.entry_price, pos.quantity).cash_delta
-        sell_fill = COST_MODEL.fill("sell", exit_price, pos.quantity)
+        buy_cost = -cost_model.fill("buy", pos.entry_price, pos.quantity).cash_delta
+        sell_fill = cost_model.fill("sell", exit_price, pos.quantity)
         sell_proceeds = sell_fill.cash_delta
         pnl = round(sell_proceeds - buy_cost, 4)
         pnl_pct = (pnl / buy_cost * 100) if buy_cost > 0 else 0.0
@@ -576,8 +612,10 @@ class PaperTradingEngine:
                     closed += 1
                     continue
 
-            # 时间止损:持有超过最大自然日离场(优先用 signal 的 holding_days)
-            max_days = DEFAULT_TIME_STOP_DAYS
+            # 时间止损:持有超过最大自然日离场
+            # 优先用 signal 的 holding_days，否则用「回测优化的该市场最优持有天数」
+            _s, _t, opt_hold = _effective_exit_params(pos.stock_market)
+            max_days = opt_hold
             if pos.signal_run_id:
                 sig_hold = (
                     db.query(StrategySignalRun.holding_days)

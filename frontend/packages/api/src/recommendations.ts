@@ -359,6 +359,208 @@ export interface StrategyWeightHistoryResponse {
   items: StrategyWeightHistoryItem[]
 }
 
+export interface AccuracyTrendPeriod {
+  period: string
+  total: number
+  wins: number
+  win_rate: number
+  avg_return_pct: number
+}
+
+export interface AccuracyTrendResponse {
+  horizon_days: number
+  granularity: string
+  days: number
+  strategy_code: string
+  market: string
+  periods: AccuracyTrendPeriod[]
+}
+
+export interface ConfidenceCalibrationBucket {
+  bucket: string
+  total: number
+  wins: number
+  win_rate: number | null
+  avg_confidence: number | null
+}
+
+export interface ConfidenceCalibrationResponse {
+  horizon_days: number
+  days: number
+  market: string
+  total_samples: number
+  buckets: ConfidenceCalibrationBucket[]
+}
+
+export interface StockSignalOutcome {
+  horizon_days: number
+  base_price: number | null
+  outcome_price: number | null
+  outcome_return_pct: number | null
+  hit_target: boolean | null
+  hit_stop: boolean | null
+  outcome_status: string
+  target_date: string | null
+}
+
+export interface StockSignalHistoryItem {
+  signal_run_id: number
+  snapshot_date: string
+  strategy_code: string
+  strategy_name: string
+  action: string
+  action_label: string
+  score: number
+  confidence: number | null
+  entry_low: number | null
+  entry_high: number | null
+  stop_loss: number | null
+  target_price: number | null
+  reason: string
+  outcome: StockSignalOutcome | null
+}
+
+export interface StockSignalHistoryResponse {
+  symbol: string
+  market: string
+  stock_name: string
+  horizon_days: number
+  days: number
+  total_signals: number
+  evaluated_count: number
+  win_count: number
+  win_rate: number | null
+  avg_return_pct: number | null
+  items: StockSignalHistoryItem[]
+}
+
+export interface TradePlanResponse {
+  available: boolean
+  symbol: string
+  market: string
+  signal?: {
+    id: number
+    snapshot_date: string
+    stock_symbol: string
+    stock_market: string
+    stock_name: string
+    strategy_code: string
+    strategy_name: string
+    rank_score: number
+    action: string
+    action_label: string
+    signal: string
+    reason: string
+    risk_level: string
+    invalidation: string
+    ai_score?: number
+    factor_explain?: {
+      positive?: { factor: string; label: string; contribution: number }[]
+      negative?: { factor: string; label: string; contribution: number }[]
+    }
+  }
+  plan?: {
+    entry_low: number | null
+    entry_high: number | null
+    entry_mid: number | null
+    stop_loss: number | null
+    target_price: number | null
+    risk_reward: number | null
+    holding_days: number
+  }
+  operability?: {
+    window_days: number
+    horizon_days: number
+    strategy_samples: number
+    strategy_win_rate: number
+    target_hit_rate: number
+    stop_hit_rate: number
+    avg_return_pct: number
+    best_return_pct: number
+    worst_return_pct: number
+    stock_samples: number
+    stock_win_rate: number
+    stock_avg_return_pct: number
+  }
+  debate?: {
+    bulls: string[]
+    bears: string[]
+    key_disagreement: string
+    verdict: string
+  }
+  paper_follow?: {
+    open_position: null | Record<string, any>
+    recent_closed: number
+    recent_win_rate: number
+    recent_avg_pnl_pct: number
+  }
+  options_advice?: OptionsAdviceBlock
+}
+
+export interface OptionsAdviceBlock {
+  available: boolean
+  data_status: string
+  optionable_guess: boolean
+  stance: string
+  conviction: 'high' | 'medium' | 'low' | string
+  price_snapshot: {
+    current_price: number | null
+    entry_low: number | null
+    entry_high: number | null
+    stop_loss: number | null
+    target_price: number | null
+    upside_pct: number
+    downside_pct: number
+    risk_reward: number | null
+    can_price: boolean
+  }
+  stock_instruction: {
+    action: string
+    text: string
+    risk_budget_pct: number
+    stop_rule: string
+    target_rule: string
+  }
+  option_instruction: {
+    name: string
+    direction: string
+    expiry: string
+    instruction: string
+    use_when: string
+  }
+  hedge_instruction: {
+    name: string
+    direction: string
+    instruction: string
+    use_when: string
+  }
+  checklist: string[]
+  learning_rules?: { severity: string; title: string; recommendation: string }[]
+  data_needed: string[]
+}
+
+export interface OptionsAdviceResponse {
+  available: boolean
+  symbol: string
+  market: string
+  message?: string
+  signal?: {
+    id: number
+    stock_name: string
+    strategy_code: string
+    strategy_name: string
+    rank_score: number
+    confidence: number | null
+    action: string
+    action_label: string
+    reason: string
+  }
+  plan?: TradePlanResponse['plan']
+  operability?: TradePlanResponse['operability']
+  advice?: OptionsAdviceBlock
+  data_needed?: string[]
+}
+
 const appendQuery = (q: URLSearchParams, key: string, value: unknown) => {
   if (value == null) return
   if (typeof value === 'string') {
@@ -564,5 +766,91 @@ export const recommendationsApi = {
     appendQuery(q, 'limit', params?.limit)
     const qs = q.toString()
     return fetchAPI<StrategyWeightHistoryResponse>(`/recommendations/strategy-weight-history${qs ? `?${qs}` : ''}`)
+  },
+
+  getAccuracyTrend: (params?: {
+    days?: number
+    horizon?: number
+    strategy_code?: string
+    market?: string
+    granularity?: 'week' | 'month'
+  }) => {
+    const q = new URLSearchParams()
+    appendQuery(q, 'days', params?.days)
+    appendQuery(q, 'horizon', params?.horizon)
+    appendQuery(q, 'strategy_code', params?.strategy_code)
+    appendQuery(q, 'market', params?.market)
+    appendQuery(q, 'granularity', params?.granularity)
+    const qs = q.toString()
+    return fetchAPI<AccuracyTrendResponse>(`/recommendations/strategy-accuracy-trend${qs ? `?${qs}` : ''}`)
+  },
+
+  getConfidenceCalibration: (params?: {
+    days?: number
+    horizon?: number
+    market?: string
+  }) => {
+    const q = new URLSearchParams()
+    appendQuery(q, 'days', params?.days)
+    appendQuery(q, 'horizon', params?.horizon)
+    appendQuery(q, 'market', params?.market)
+    const qs = q.toString()
+    return fetchAPI<ConfidenceCalibrationResponse>(`/recommendations/strategy-confidence-calibration${qs ? `?${qs}` : ''}`)
+  },
+
+  getStockSignalHistory: (params: {
+    symbol: string
+    market?: string
+    days?: number
+    horizon?: number
+  }) => {
+    const q = new URLSearchParams()
+    q.set('symbol', params.symbol)
+    appendQuery(q, 'market', params?.market)
+    appendQuery(q, 'days', params?.days)
+    appendQuery(q, 'horizon', params?.horizon)
+    return fetchAPI<StockSignalHistoryResponse>(`/recommendations/stock-signal-history?${q.toString()}`)
+  },
+
+  getTradePlan: (params: {
+    symbol: string
+    market?: string
+    days?: number
+    horizon?: number
+    current_price?: number
+    iv_rank?: number
+    holding_qty?: number
+  }) => {
+    const q = new URLSearchParams()
+    q.set('symbol', params.symbol)
+    appendQuery(q, 'market', params?.market)
+    appendQuery(q, 'days', params?.days)
+    appendQuery(q, 'horizon', params?.horizon)
+    appendQuery(q, 'current_price', params?.current_price)
+    appendQuery(q, 'iv_rank', params?.iv_rank)
+    appendQuery(q, 'holding_qty', params?.holding_qty)
+    return fetchAPI<TradePlanResponse>(`/recommendations/trade-plan?${q.toString()}`)
+  },
+
+  getOptionsAdvice: (params: {
+    symbol: string
+    market?: string
+    days?: number
+    horizon?: number
+    current_price?: number
+    iv_rank?: number
+    holding_qty?: number
+    risk_budget_pct?: number
+  }) => {
+    const q = new URLSearchParams()
+    q.set('symbol', params.symbol)
+    appendQuery(q, 'market', params?.market)
+    appendQuery(q, 'days', params?.days)
+    appendQuery(q, 'horizon', params?.horizon)
+    appendQuery(q, 'current_price', params?.current_price)
+    appendQuery(q, 'iv_rank', params?.iv_rank)
+    appendQuery(q, 'holding_qty', params?.holding_qty)
+    appendQuery(q, 'risk_budget_pct', params?.risk_budget_pct)
+    return fetchAPI<OptionsAdviceResponse>(`/recommendations/options-advice?${q.toString()}`)
   },
 }

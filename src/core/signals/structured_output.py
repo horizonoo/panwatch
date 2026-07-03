@@ -16,11 +16,61 @@ ALLOWED_ACTIONS = {
 
 ACTION_ALIASES = {
     "build": "add",
+    "long": "buy",
+    "accumulate": "add",
+    "trim": "reduce",
+    "take_profit": "reduce",
+    "stop_loss": "sell",
+    "wait": "watch",
+    "neutral": "hold",
+    "ignore": "avoid",
+    "买入": "buy",
+    "买": "buy",
+    "建仓": "buy",
+    "准备建仓": "buy",
+    "加仓": "add",
+    "增持": "add",
+    "减仓": "reduce",
+    "减持": "reduce",
+    "止盈": "reduce",
+    "卖出": "sell",
+    "卖": "sell",
+    "清仓": "sell",
+    "止损": "sell",
+    "持有": "hold",
+    "继续持有": "hold",
+    "观望": "watch",
+    "关注": "watch",
+    "预警": "alert",
+    "设置预警": "alert",
+    "回避": "avoid",
+    "暂时回避": "avoid",
+}
+
+ACTION_LABELS = {
+    "buy": "买入",
+    "add": "加仓",
+    "reduce": "减仓",
+    "sell": "卖出",
+    "hold": "持有",
+    "watch": "观望",
+    "alert": "设置预警",
+    "avoid": "暂时回避",
 }
 
 
 TAG_START = "<!--PANWATCH_JSON-->"
 TAG_END = "<!--/PANWATCH_JSON-->"
+
+
+def normalize_action(action: object) -> str:
+    """Normalize LLM action aliases to PanWatch action codes."""
+    raw = str(action or "").strip()
+    if not raw:
+        return ""
+    key = raw.lower().replace("-", "_").replace(" ", "_")
+    normalized = ACTION_ALIASES.get(key) or ACTION_ALIASES.get(raw) or key
+    return normalized if normalized in ALLOWED_ACTIONS else ""
 
 
 def try_parse_action_json(text: str) -> dict | None:
@@ -50,12 +100,12 @@ def try_parse_action_json(text: str) -> dict | None:
         return None
     if not isinstance(obj, dict):
         return None
-    action = (obj.get("action") or "").strip().lower()
-    if action in ACTION_ALIASES:
-        obj["action"] = ACTION_ALIASES[action]
-        action = obj["action"]
-    if action and action not in ALLOWED_ACTIONS:
+    action = normalize_action(obj.get("action"))
+    if obj.get("action") and not action:
         return None
+    if action:
+        obj["action"] = action
+        obj.setdefault("action_label", ACTION_LABELS.get(action, action))
     return obj
 
 
